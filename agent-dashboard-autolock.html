@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoLock — Live Chat Dashboard</title>
+<style>
+  :root {
+    --red:       #c0392b;
+    --red-dark:  #a93226;
+    --red-soft:  #e74c3c;
+    --bg:        #140e0e;
+    --bg2:       #1a1010;
+    --bg3:       #221515;
+    --bg4:       #2a1a1a;
+    --border:    #3a1f1f;
+    --border2:   #4a2828;
+    --text:      #f0dede;
+    --text-dim:  #a07070;
+    --text-mute: #6b4040;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #topbar {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+    height: 54px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+  #topbar .brand { display: flex; align-items: center; gap: 10px; }
+  #topbar .brand-icon {
+    width: 32px; height: 32px;
+    background: linear-gradient(135deg, var(--red-dark), var(--red-soft));
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 8px rgba(192,57,43,0.4);
+  }
+  #topbar .brand-icon svg { width: 18px; height: 18px; fill: #fff; }
+  #topbar .brand-name { font-size: 15px; font-weight: 700; color: #fff; letter-spacing: -0.01em; }
+  #topbar .brand-sub { font-size: 12px; color: var(--text-mute); margin-left: 4px; }
+  #topbar .status { font-size: 12px; color: var(--text-mute); display: flex; align-items: center; gap: 6px; }
+  #topbar .dot { width: 8px; height: 8px; border-radius: 50%; background: #6effa0; box-shadow: 0 0 6px #6effa0; animation: pulse 2s infinite; }
+  #topbar .dot.offline { background: #fc8181; box-shadow: 0 0 6px #fc8181; animation: none; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+
+
+  #main { display: flex; flex: 1; min-height: 0; }
+
+  #sidebar {
+    width: 268px;
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    flex-shrink: 0;
+  }
+  #sidebar-header {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 700;
+    color: var(--text-mute); text-transform: uppercase;
+    letter-spacing: 0.06em;
+    display: flex; align-items: center; justify-content: space-between;
+    flex-shrink: 0;
+  }
+  #session-count {
+    background: linear-gradient(135deg, var(--red), var(--red-soft));
+    color: #fff;
+    border-radius: 10px; padding: 1px 7px;
+    font-size: 11px; font-weight: 700;
+    box-shadow: 0 1px 6px rgba(192,57,43,0.4);
+  }
+  #session-list { flex: 1; overflow-y: auto; }
+  #session-list::-webkit-scrollbar { width: 4px; }
+  #session-list::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+  .session-item {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    display: flex; align-items: center; gap: 10px;
+    transition: background 0.1s;
+    border-left: 3px solid transparent;
+  }
+  .session-item:hover { background: var(--bg3); }
+  .session-item.active { background: #2a1010; border-left-color: var(--red-soft); }
+  .session-item .avatar {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--red-dark), var(--red-soft));
+    color: #fff;
+    font-size: 13px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    box-shadow: 0 2px 6px rgba(192,57,43,0.35);
+  }
+  .session-item .info { flex: 1; min-width: 0; }
+  .session-item .s-name { font-size: 13.5px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .session-item .s-preview { font-size: 12px; color: var(--text-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+  .session-item .unread { width: 8px; height: 8px; border-radius: 50%; background: var(--red-soft); flex-shrink: 0; box-shadow: 0 0 6px var(--red-soft); }
+
+  #empty-state {
+    padding: 40px 20px; text-align: center;
+    color: var(--text-mute); font-size: 13px; line-height: 1.7;
+  }
+
+  #chat-panel {
+    flex: 1; display: flex; flex-direction: column;
+    min-width: 0; background: var(--bg);
+  }
+  #chat-header {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex; align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0; min-height: 56px;
+  }
+  #chat-name { font-size: 15px; font-weight: 700; color: #fff; }
+  #chat-meta { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
+  #close-session-btn {
+    padding: 6px 14px;
+    background: #1a0505; color: #fc8181;
+    border: 1px solid var(--red-dark); border-radius: 6px;
+    font-size: 12px; cursor: pointer; font-weight: 600;
+    transition: background 0.15s; display: none;
+  }
+  #close-session-btn:hover { background: #2a0a0a; }
+
+  #messages {
+    flex: 1; overflow-y: auto;
+    padding: 16px 20px;
+    display: none; flex-direction: column; gap: 8px;
+    min-height: 0;
+  }
+  #messages::-webkit-scrollbar { width: 4px; }
+  #messages::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+  .msg-wrap { display: flex; flex-direction: column; }
+  .msg { max-width: 72%; padding: 9px 13px; border-radius: 12px; font-size: 13.5px; line-height: 1.5; word-break: break-word; }
+  .msg-label { font-size: 11px; color: var(--text-mute); margin-bottom: 3px; padding: 0 2px; }
+  .msg-label.right { text-align: right; }
+  .msg-customer { align-self: flex-start; background: var(--bg3); color: var(--text); border: 1px solid var(--border2); border-bottom-left-radius: 3px; }
+  .msg-agent { align-self: flex-end; background: linear-gradient(135deg, var(--red) 0%, var(--red-soft) 100%); color: #fff; font-weight: 500; border-bottom-right-radius: 3px; box-shadow: 0 2px 8px rgba(192,57,43,0.35); }
+  .msg-system { align-self: center; font-size: 11.5px; color: var(--text-mute); padding: 2px 0; }
+
+  #no-chat {
+    flex: 1; display: flex; align-items: center;
+    justify-content: center; flex-direction: column;
+    gap: 12px; color: var(--text-mute); font-size: 14px;
+  }
+  #no-chat svg { width: 48px; height: 48px; fill: var(--border2); }
+
+  #input-bar {
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+    padding: 12px 16px;
+    display: none; gap: 10px; align-items: flex-end;
+    flex-shrink: 0;
+  }
+  #agent-input {
+    flex: 1; padding: 9px 13px;
+    border: 1px solid var(--border2); border-radius: 12px;
+    font-size: 14px; outline: none;
+    background: var(--bg3); color: var(--text);
+    resize: none; line-height: 1.5;
+    max-height: 100px; overflow-y: auto;
+    font-family: inherit;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    min-height: 40px;
+  }
+  #agent-input:focus { border-color: var(--red-soft); box-shadow: 0 0 0 3px rgba(231,76,60,0.12); }
+  #agent-input::placeholder { color: var(--text-mute); }
+  #send-btn {
+    width: 40px; height: 40px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--red), var(--red-soft));
+    border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; transition: opacity 0.15s, transform 0.1s;
+    box-shadow: 0 2px 8px rgba(192,57,43,0.4);
+  }
+  #send-btn:hover { opacity: 0.88; transform: scale(1.05); }
+  #send-btn:disabled { background: var(--border2); box-shadow: none; cursor: not-allowed; transform: none; opacity: 0.5; }
+  #send-btn svg { width: 16px; height: 16px; fill: #fff; }
+
+  #toast {
+    position: fixed; top: 16px; right: 16px;
+    background: linear-gradient(135deg, var(--red), var(--red-soft));
+    color: #fff;
+    padding: 10px 16px; border-radius: 8px;
+    font-size: 13px; font-weight: 600;
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.2s; z-index: 999;
+    max-width: 280px;
+    box-shadow: 0 4px 16px rgba(192,57,43,0.45);
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div id="toast"></div>
+
+<div id="topbar">
+  <div class="brand">
+    <div class="brand-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+    </div>
+    <span class="brand-name">AutoLock</span>
+    <span class="brand-sub">Live Chat Dashboard</span>
+  </div>
+  <div class="status">
+    <span class="dot offline" id="status-dot"></span>
+    <span id="status-text">Forbinder...</span>
+    <span id="agent-name-badge" style="margin-left:10px;padding:2px 9px;background:rgba(192,57,43,0.18);border:1px solid var(--border2);border-radius:10px;font-size:11px;color:var(--text-dim);font-weight:600;letter-spacing:0.04em;"></span>
+  </div>
+</div>
+
+
+<div id="main">
+  <div id="sidebar">
+    <div id="sidebar-header">
+      Aktive chats
+      <span id="session-count">0</span>
+    </div>
+    <div id="session-list">
+      <div id="empty-state">Ingen aktive chats.<br>Afventer kunder...</div>
+    </div>
+  </div>
+
+  <div id="chat-panel">
+    <div id="chat-header">
+      <div>
+        <div id="chat-name">Vælg en chat</div>
+        <div id="chat-meta"></div>
+      </div>
+      <button id="close-session-btn" onclick="closeSession()">Afslut chat</button>
+    </div>
+
+    <div id="no-chat">
+      <svg viewBox="0 0 24 24"><path d="M20 2H4C2.9 2 2 2.9 2 4v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 12H6l-2 2V4h16v10z"/></svg>
+      <p>Vælg en chat i venstre side</p>
+    </div>
+
+    <div id="messages"></div>
+
+    <div id="input-bar">
+      <textarea id="agent-input" rows="1" placeholder="Skriv svar til kunde..."></textarea>
+      <button id="send-btn" onclick="sendReply()" aria-label="Send">
+        <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var API_BASE = ''; // Relativ URL – virker både lokalt og på Vercel
+  var AGENT_SECRET = 'p2nh7wqt5xm3rvkd8bjyfe6lcs4aguoz';
+  var sessions = {};          // id -> { id, name, email, phone, status, messages: [], unread: 0 }
+  var activeSessionId = null;
+  // Hent agentens navn fra auth (AutoLockAuth eller MSAL)
+  var AGENT_NAME = (typeof AutoLockAuth !== 'undefined' && AutoLockAuth.getUsername && AutoLockAuth.getUsername()) || 'Agent';
+  var agentBadge = document.getElementById('agent-name-badge');
+  if (agentBadge) agentBadge.textContent = AGENT_NAME;
+  var pollTimer = null;
+  var isPolling = false;
+
+  var sessionList  = document.getElementById('session-list');
+  var emptyState   = document.getElementById('empty-state');
+  var sessionCount = document.getElementById('session-count');
+  var chatNameEl   = document.getElementById('chat-name');
+  var chatMetaEl   = document.getElementById('chat-meta');
+  var messagesEl   = document.getElementById('messages');
+  var noChatEl     = document.getElementById('no-chat');
+  var inputBar     = document.getElementById('input-bar');
+  var agentInput   = document.getElementById('agent-input');
+  var sendBtn      = document.getElementById('send-btn');
+  var closeBtn     = document.getElementById('close-session-btn');
+  var statusDot    = document.getElementById('status-dot');
+  var statusText   = document.getElementById('status-text');
+  var toastEl      = document.getElementById('toast');
+
+  requestNotifPermission();
+  startPolling();
+
+  function requestNotifPermission() {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }
+
+  function setStatus(online) {
+    statusDot.className = 'dot' + (online ? '' : ' offline');
+    statusText.textContent = online ? 'Online' : 'Ingen forbindelse';
+  }
+
+  var toastTimer = null;
+  function showToast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function() { toastEl.classList.remove('show'); }, 3500);
+  }
+
+  function startPolling() {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    isPolling = false;
+    poll();
+  }
+
+  function poll() {
+    if (isPolling || !API_BASE) return;
+    isPolling = true;
+    fetch(API_BASE + '/health')
+      .then(function(r) { return r.json(); })
+      .then(function() {
+        setStatus(true);
+        return fetchSessions();
+      })
+      .catch(function() {
+        setStatus(false);
+        isPolling = false;
+        pollTimer = setTimeout(poll, 4000);
+      });
+  }
+
+  function fetchSessions() {
+    return fetch(API_BASE + '/sessions', { headers: { 'X-Agent-Secret': AGENT_SECRET } })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var list = data.sessions || [];
+        handleSessionList(list);
+        var fetchPromise = activeSessionId
+          ? fetchMessages(activeSessionId)
+          : Promise.resolve();
+        return fetchPromise;
+      })
+      .then(function() {
+        isPolling = false;
+        pollTimer = setTimeout(poll, 1500);
+      })
+      .catch(function() {
+        isPolling = false;
+        pollTimer = setTimeout(poll, 4000);
+      });
+  }
+
+  function handleSessionList(list) {
+    var open = list.filter(function(s) { return s.status === 'open'; });
+
+    // Detect new sessions
+    open.forEach(function(s) {
+      if (!sessions[s.id]) {
+        sessions[s.id] = Object.assign({}, s, { messages: [], unread: 0 });
+        showToast('Ny kunde: ' + s.name);
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          new Notification('AutoLock Chat', { body: s.name + ' har startet en chat' });
+        }
+      } else {
+        // Update metadata but preserve messages/unread
+        sessions[s.id].name   = s.name;
+        sessions[s.id].email  = s.email;
+        sessions[s.id].phone  = s.phone;
+        sessions[s.id].status = s.status;
+      }
+    });
+
+    // Mark sessions as closed if they're no longer open (but keep them in sidebar)
+    Object.keys(sessions).forEach(function(id) {
+      var stillOpen = open.some(function(s) { return s.id === id; });
+      if (!stillOpen && sessions[id].status === 'open') {
+        sessions[id].status = 'closed';
+        // If this is the active session, update UI to show it's closed
+        if (activeSessionId === id) {
+          closeBtn.style.display = 'none';
+          inputBar.style.display = 'none';
+          chatMetaEl.textContent = chatMetaEl.textContent.replace(/^/, '🔴 Lukket · ');
+          var closedMsg = document.createElement('div');
+          closedMsg.className = 'msg-wrap';
+          var sys = document.createElement('div');
+          sys.className = 'msg msg-system';
+          sys.textContent = 'Kunden afsluttede chatten';
+          closedMsg.appendChild(sys);
+          messagesEl.appendChild(closedMsg);
+          scrollMessages();
+        }
+      }
+    });
+
+    // Add any new open sessions
+    var allVisible = Object.values(sessions);
+    sessionCount.textContent = open.length;
+    renderSessionList(allVisible);
+  }
+
+  function renderSessionList(list) {
+    var open = list.filter(function(s) { return s.status === 'open'; });
+    var closed = list.filter(function(s) { return s.status !== 'open'; });
+    var sorted = open.concat(closed);
+
+    if (sorted.length === 0) {
+      sessionList.innerHTML = '';
+      sessionList.appendChild(emptyState);
+      return;
+    }
+    sessionList.innerHTML = '';
+    sorted.forEach(function(s) {
+      var sd = sessions[s.id];
+      var msgs = sd ? sd.messages : [];
+      var last = msgs.length ? msgs[msgs.length - 1] : null;
+      var preview = last ? last.text : 'Chat startet';
+      var hasUnread = sd && sd.unread > 0;
+      var isClosed = s.status !== 'open';
+      var initials = s.name.split(' ').map(function(w) { return w[0]; }).join('').toUpperCase().slice(0, 2);
+
+      var div = document.createElement('div');
+      div.className = 'session-item' + (s.id === activeSessionId ? ' active' : '');
+      if (isClosed) div.style.opacity = '0.55';
+      div.innerHTML =
+        '<div class="avatar" style="' + (isClosed ? 'background:var(--border2);box-shadow:none;' : '') + '">' + esc(initials) + '</div>' +
+        '<div class="info">' +
+          '<div class="s-name">' + esc(s.name) + (isClosed ? ' <span style="font-size:10px;color:var(--text-mute);font-weight:400;">(lukket)</span>' : '') + '</div>' +
+          '<div class="s-preview">' + esc(preview.slice(0, 50)) + '</div>' +
+        '</div>' +
+        (hasUnread ? '<div class="unread"></div>' : '');
+
+      if (!isClosed) {
+        div.addEventListener('click', function() { selectSession(s.id); });
+      } else {
+        // Closed sessions: clickable to view, but show a "Fjern" button
+        div.style.cursor = 'pointer';
+        var removeBtn = document.createElement('button');
+        removeBtn.textContent = '✕';
+        removeBtn.title = 'Fjern fra liste';
+        removeBtn.style.cssText = 'background:none;border:none;color:var(--text-mute);cursor:pointer;font-size:14px;padding:4px 6px;border-radius:4px;flex-shrink:0;';
+        removeBtn.addEventListener('mouseenter', function() { this.style.color = '#fc8181'; });
+        removeBtn.addEventListener('mouseleave', function() { this.style.color = 'var(--text-mute)'; });
+        removeBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          delete sessions[s.id];
+          if (activeSessionId === s.id) {
+            activeSessionId = null;
+            chatNameEl.textContent = 'Vælg en chat';
+            chatMetaEl.textContent = '';
+            messagesEl.style.display = 'none';
+            messagesEl.innerHTML = '';
+            noChatEl.style.display = 'flex';
+            inputBar.style.display = 'none';
+            closeBtn.style.display = 'none';
+          }
+          renderSessionList(Object.values(sessions));
+          sessionCount.textContent = Object.values(sessions).filter(function(sd) { return sd.status === 'open'; }).length;
+        });
+        div.addEventListener('click', function() { selectSession(s.id); });
+        div.appendChild(removeBtn);
+      }
+
+      sessionList.appendChild(div);
+    });
+  }
+
+  function selectSession(id) {
+    if (!sessions[id]) return;
+    activeSessionId = id;
+    var s = sessions[id];
+    s.unread = 0;
+    var isClosed = s.status !== 'open';
+
+    chatNameEl.textContent = s.name || 'Kunde';
+    var meta = 'Session: ' + id.slice(0, 8);
+    if (s.email) meta += ' · ' + s.email;
+    if (s.phone) meta += ' · ' + s.phone;
+    if (isClosed) meta = '🔴 Lukket · ' + meta;
+    chatMetaEl.textContent = meta;
+
+    messagesEl.style.display = 'flex';
+    noChatEl.style.display = 'none';
+    inputBar.style.display = isClosed ? 'none' : 'flex';
+    closeBtn.style.display = isClosed ? 'none' : 'block';
+
+    rebuildMessages(id);
+    agentInput.focus();
+
+    // Re-render sidebar to clear unread dot and set active state
+    renderSessionList(Object.values(sessions));
+
+    // Fetch latest messages immediately
+    fetchMessages(id);
+  }
+
+  function rebuildMessages(sessionId) {
+    var s = sessions[sessionId];
+    messagesEl.innerHTML = '';
+    if (!s) return;
+    s.messages.forEach(function(m) { appendMessageEl(m, s.name || 'Kunde'); });
+    scrollMessages();
+  }
+
+  function fetchMessages(sessionId) {
+    return fetch(API_BASE + '/messages/' + sessionId, { headers: { 'X-Agent-Secret': AGENT_SECRET } })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var msgs = data.messages || [];
+        var s = sessions[sessionId];
+        if (!s) return;
+
+        var knownIds = {};
+        s.messages.forEach(function(m) { knownIds[msgKey(m)] = true; });
+
+        var added = false;
+        msgs.forEach(function(m) {
+          var key = msgKey(m);
+          if (!knownIds[key]) {
+            knownIds[key] = true;
+            s.messages.push(m);
+            added = true;
+            if (m.role === 'customer' && sessionId !== activeSessionId) {
+              s.unread++;
+              showToast((s.name || 'Kunde') + ': ' + m.text.slice(0, 60));
+            }
+          }
+        });
+
+        if (added && sessionId === activeSessionId) {
+          rebuildMessages(sessionId);
+        }
+        if (added) {
+          renderSessionList(Object.values(sessions));
+        }
+      })
+      .catch(function() {});
+  }
+
+  function msgKey(m) {
+    return (m.id || '') + '|' + (m.role || '') + '|' + (m.text || '').slice(0, 40);
+  }
+
+  function appendMessageEl(msg, customerName) {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg-wrap';
+
+    if (msg.role === 'system') {
+      var sys = document.createElement('div');
+      sys.className = 'msg msg-system';
+      sys.textContent = msg.text;
+      wrap.appendChild(sys);
+    } else {
+      var label = document.createElement('div');
+      label.className = 'msg-label' + (msg.role === 'agent' ? ' right' : '');
+      label.textContent = msg.role === 'agent' ? (msg.agentName || AGENT_NAME) : (customerName || 'Kunde');
+
+      var div = document.createElement('div');
+      div.className = 'msg msg-' + msg.role;
+      div.textContent = msg.text;
+
+      wrap.appendChild(label);
+      wrap.appendChild(div);
+    }
+
+    messagesEl.appendChild(wrap);
+  }
+
+  function scrollMessages() {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  window.sendReply = function () {
+    var text = agentInput.value.trim();
+    if (!text || !activeSessionId) return;
+
+    agentInput.value = '';
+    agentInput.style.height = 'auto';
+    sendBtn.disabled = true;
+
+    fetch(API_BASE + '/agent/reply', { // requires agent auth
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
+      body: JSON.stringify({ sessionId: activeSessionId, message: text, agentName: AGENT_NAME })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      sendBtn.disabled = false;
+      if (data.message) {
+        var s = sessions[activeSessionId];
+        if (s) {
+          // Berig med agentName hvis serveren ikke returnerer det
+          if (!data.message.agentName) data.message.agentName = AGENT_NAME;
+          var key = msgKey(data.message);
+          var already = s.messages.some(function(m) { return msgKey(m) === key; });
+          if (!already) {
+            s.messages.push(data.message);
+            appendMessageEl(data.message, s.name || 'Dig');
+            scrollMessages();
+          }
+        }
+      }
+    })
+    .catch(function() {
+      sendBtn.disabled = false;
+      showToast('Svar kunne ikke sendes');
+    });
+  };
+
+  window.closeSession = function () {
+    if (!activeSessionId) return;
+    var sid = activeSessionId;
+    fetch(API_BASE + '/session/close', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Session-Id': sid }
+    })
+    .then(function() {
+      delete sessions[sid];
+      activeSessionId = null;
+      chatNameEl.textContent = 'Vælg en chat';
+      chatMetaEl.textContent = '';
+      messagesEl.style.display = 'none';
+      messagesEl.innerHTML = '';
+      noChatEl.style.display = 'flex';
+      inputBar.style.display = 'none';
+      closeBtn.style.display = 'none';
+      renderSessionList(Object.values(sessions).filter(function(sd) { return sd.status === 'open'; }));
+    })
+    .catch(function() {
+      showToast('Kunne ikke afslutte session');
+    });
+  };
+
+  agentInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      window.sendReply();
+    }
+  });
+
+  agentInput.addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 100) + 'px';
+  });
+
+  function esc(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+})();
+</script>
+</body>
+</html>

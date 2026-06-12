@@ -1,0 +1,609 @@
+<html lang="da">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoLock — Agent Login</title>
+
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'self'; script-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://alcdn.msauth.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' *; frame-ancestors 'none';">
+<meta http-equiv="X-Frame-Options" content="DENY">
+<meta http-equiv="X-Content-Type-Options" content="nosniff">
+<meta http-equiv="Referrer-Policy" content="no-referrer">
+<meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --red:       #c0392b;
+    --red-dark:  #a93226;
+    --red-soft:  #e74c3c;
+    --bg:        #0e0808;
+    --bg2:       #140b0b;
+    --bg3:       #1c1010;
+    --border:    #2e1616;
+    --border2:   #3d2020;
+    --text:      #f0dede;
+    --text-dim:  #a07070;
+    --text-mute: #5a3535;
+    --orange:    #e67e22;
+    --green:     #27ae60;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; display: flex;
+    align-items: center; justify-content: center;
+    overflow: hidden; position: relative;
+  }
+  body::before {
+    content: ''; position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(192,57,43,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(192,57,43,0.04) 1px, transparent 1px);
+    background-size: 40px 40px; pointer-events: none;
+  }
+  body::after {
+    content: ''; position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 700px; height: 700px;
+    background: radial-gradient(circle, rgba(192,57,43,0.12) 0%, transparent 65%);
+    pointer-events: none;
+  }
+  .login-wrap {
+    width: 100%; max-width: 420px; padding: 20px;
+    z-index: 1; animation: fadeUp 0.5s ease both;
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .brand {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 36px; justify-content: center;
+  }
+  .brand-icon {
+    width: 44px; height: 44px;
+    background: linear-gradient(135deg, var(--red-dark), var(--red-soft));
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 20px rgba(192,57,43,0.5);
+  }
+  .brand-icon svg { width: 24px; height: 24px; fill: #fff; }
+  .brand-name { font-size: 22px; font-weight: 700; color: #fff; letter-spacing: -0.02em; line-height: 1; }
+  .brand-sub  { font-size: 12px; color: var(--text-mute); font-family: 'DM Mono', monospace; letter-spacing: 0.05em; margin-top: 3px; }
+
+  .card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 16px; padding: 36px 32px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(192,57,43,0.05);
+    position: relative; overflow: hidden;
+  }
+  .card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(231,76,60,0.4), transparent);
+  }
+  .card-title { font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 4px; letter-spacing: -0.01em; }
+  .card-sub   { font-size: 13px; color: var(--text-dim); margin-bottom: 28px; }
+
+  /* ── View switcher (login ↔ forgot) ─── */
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* ── Bannere ── */
+  .banner {
+    border-radius: 8px; padding: 10px 13px; font-size: 13px;
+    margin-bottom: 16px; display: none; line-height: 1.5;
+  }
+  .banner.show { display: block; }
+  .banner-error   { background: rgba(192,57,43,0.12); border: 1px solid rgba(192,57,43,0.3); color: #fc8181; }
+  .banner-warning { background: rgba(230,126,34,0.12); border: 1px solid rgba(230,126,34,0.3); color: #f39c12; }
+  .banner-lock    { background: rgba(192,57,43,0.18); border: 1px solid rgba(192,57,43,0.5); color: #fc8181; font-weight: 600; }
+  .banner-success { background: rgba(39,174,96,0.12);  border: 1px solid rgba(39,174,96,0.3);  color: #6fcf97; }
+
+  /* ── URL-bar ── */
+  .url-bar {
+    background: #1a0a0a; border: 1px solid var(--red-dark);
+    border-radius: 8px; padding: 8px 13px; font-size: 12px;
+    color: var(--red-soft); margin-bottom: 20px; display: none;
+    align-items: center; gap: 8px;
+  }
+  .url-bar.show { display: flex; }
+  .url-bar input {
+    flex: 1; background: var(--bg3); border: 1px solid var(--border2);
+    border-radius: 6px; color: var(--text); font-size: 12px;
+    font-family: 'DM Mono', monospace; padding: 5px 8px; outline: none;
+  }
+  .url-bar button {
+    padding: 5px 10px; background: var(--red); color: #fff;
+    border: none; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 700;
+  }
+
+  /* ── Fields ── */
+  .field { margin-bottom: 18px; }
+  .field label {
+    display: block; font-size: 12px; font-weight: 700;
+    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.07em;
+    margin-bottom: 7px; font-family: 'DM Mono', monospace;
+  }
+  .field-inner { position: relative; }
+  .field-inner .icon {
+    position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+    width: 16px; height: 16px; fill: var(--text-mute); pointer-events: none; transition: fill 0.2s;
+  }
+  .field input {
+    width: 100%; padding: 11px 40px 11px 38px;
+    background: var(--bg3); border: 1px solid var(--border2);
+    border-radius: 10px; color: var(--text);
+    font-size: 14px; font-family: 'DM Sans', sans-serif;
+    outline: none; transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .field input[type="email"],
+  .field input.no-right-icon { padding-right: 14px; }
+  .field input::placeholder { color: var(--text-mute); }
+  .field input:focus { border-color: var(--red-soft); box-shadow: 0 0 0 3px rgba(231,76,60,0.12); }
+  .field input:disabled { opacity: 0.5; cursor: not-allowed; }
+  .field-inner:focus-within .icon { fill: var(--red-soft); }
+  .show-toggle {
+    position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; cursor: pointer; padding: 4px; display: flex; align-items: center;
+  }
+  .show-toggle svg { width: 16px; height: 16px; fill: var(--text-mute); }
+  .show-toggle:hover svg { fill: var(--text-dim); }
+
+  /* ── Attempts dots ── */
+  .attempts-bar { display: flex; gap: 4px; margin-top: 6px; margin-bottom: 4px; }
+  .attempt-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--border2); transition: background 0.3s;
+  }
+  .attempt-dot.used { background: var(--red-soft); }
+  .attempt-dot.warn { background: var(--orange); }
+
+  #lockout-timer { font-family: 'DM Mono', monospace; font-size: 15px; }
+
+  /* ── Buttons ── */
+  .submit-btn {
+    width: 100%; padding: 13px;
+    background: linear-gradient(135deg, var(--red), var(--red-soft));
+    color: #fff; font-weight: 700; font-size: 14px;
+    font-family: 'DM Sans', sans-serif;
+    border: none; border-radius: 10px; cursor: pointer;
+    box-shadow: 0 4px 16px rgba(192,57,43,0.4);
+    transition: opacity 0.15s, transform 0.1s, box-shadow 0.15s;
+    position: relative; overflow: hidden;
+  }
+  .submit-btn:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); box-shadow: 0 6px 20px rgba(192,57,43,0.5); }
+  .submit-btn:active:not(:disabled) { transform: translateY(0); }
+  .submit-btn:disabled { background: var(--border2); box-shadow: none; cursor: not-allowed; opacity: 1; }
+  .submit-btn .spinner {
+    display: none; width: 16px; height: 16px;
+    border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff;
+    border-radius: 50%; animation: spin 0.7s linear infinite; margin: 0 auto;
+  }
+  .submit-btn.loading .btn-text { display: none; }
+  .submit-btn.loading .spinner  { display: block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Forgot link ── */
+  .forgot-link-row {
+    text-align: right; margin-top: -10px; margin-bottom: 18px;
+  }
+  .forgot-link {
+    font-size: 12px; color: var(--text-dim);
+    background: none; border: none; cursor: pointer; padding: 0;
+    font-family: 'DM Mono', monospace; letter-spacing: 0.02em;
+    text-decoration: underline; text-underline-offset: 3px;
+    transition: color 0.15s;
+  }
+  .forgot-link:hover { color: var(--red-soft); }
+
+  /* ── Back link ── */
+  .back-link {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; color: var(--text-dim);
+    background: none; border: none; cursor: pointer; padding: 0 0 20px 0;
+    font-family: 'DM Mono', monospace; letter-spacing: 0.02em;
+    transition: color 0.15s;
+  }
+  .back-link:hover { color: var(--red-soft); }
+  .back-link svg { width: 12px; height: 12px; fill: currentColor; }
+
+  .footer-note { text-align: center; font-size: 12px; color: var(--text-mute); margin-top: 20px; font-family: 'DM Mono', monospace; }
+  .footer-note span { color: var(--text-dim); }
+
+  @keyframes shake {
+    0%,100%{ transform:translateX(0); } 20%{ transform:translateX(-8px); }
+    40%{ transform:translateX(8px); }  60%{ transform:translateX(-5px); }
+    80%{ transform:translateX(5px); }
+  }
+  .shake { animation: shake 0.4s ease; }
+  /* ── Microsoft sign-in button ── */
+  .ms-divider {
+    display: flex; align-items: center; gap: 10px;
+    margin: 20px 0 16px; color: var(--text-mute); font-size: 12px;
+  }
+  .ms-divider::before, .ms-divider::after {
+    content: ""; flex: 1; height: 1px; background: var(--border);
+  }
+  .ms-login-btn {
+    width: 100%; padding: 11px 16px;
+    background: #ffffff; color: #1a1a1a;
+    border: 1px solid #d0d0d0; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    font-family: "DM Sans", sans-serif; font-size: 14px; font-weight: 500;
+    cursor: pointer; transition: background 0.15s, box-shadow 0.15s;
+  }
+  .ms-login-btn:hover { background: #f3f3f3; box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+  .ms-login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* ChatGPT UI polish */
+.card{
+  backdrop-filter: blur(10px);
+}
+body{
+  overflow-y:auto !important;
+  padding:20px;
+}
+.login-wrap{
+  max-width:520px !important;
+}
+@media (max-width:768px){
+  .card{
+    padding:24px !important;
+    border-radius:14px !important;
+  }
+  .brand-name{
+    font-size:20px !important;
+  }
+}
+.ms-login-btn{
+  min-height:48px;
+}
+.field input{
+  min-height:46px;
+}
+
+</style>
+</head>
+<body>
+
+<!-- Microsoft MSAL (Azure AD authentication) -->
+<script src="msal-browser.min.js"></script>
+
+<script src="auth.js"></script>
+
+<div class="login-wrap">
+  <div class="brand">
+    <div class="brand-icon">
+      <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+    </div>
+    <div class="brand-text">
+      <div class="brand-name">AutoLock</div>
+      <div class="brand-sub">AGENT PANEL</div>
+    </div>
+  </div>
+
+  <!-- Server URL bar -->
+  <div class="url-bar" id="url-bar">
+    <span>⚙</span>
+    <input type="text" id="api-url-input" placeholder="https://din-server.dk" />
+    <button onclick="saveApiUrl()">Gem</button>
+  </div>
+
+ 
+
+      <!-- Microsoft / Azure AD login -->
+      <button class="ms-login-btn" id="ms-login-btn" type="button" onclick="msalSignIn()">
+        <svg class="ms-logo" xmlns="http://www.w3.org/2000/svg" width="21" height="21" viewBox="0 0 21 21">
+          <rect x="1"  y="1"  width="9" height="9" fill="#f25022"/>
+          <rect x="11" y="1"  width="9" height="9" fill="#00a4ef"/>
+          <rect x="1"  y="11" width="9" height="9" fill="#7fba00"/>
+          <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+        </svg>
+        <span class="btn-text">Sign in with Microsoft</span>
+      </button>
+    </div><!-- /view-login -->
+
+    <!-- ════════════ VIEW: FORGOT PASSWORD ════════════ -->
+    <div class="view" id="view-forgot">
+      <button class="back-link" id="back-to-login" type="button">
+        <svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+        Tilbage til login
+      </button>
+      <div class="card-title">Glemt adgangskode</div>
+      <div class="card-sub">Indtast din email, og vi sender dig et nulstillingslink.</div>
+
+      <div class="banner banner-success" id="forgot-banner-ok"></div>
+      <div class="banner banner-error"   id="forgot-banner-err"></div>
+
+      <div class="field">
+        <label for="forgot-email">Email</label>
+        <div class="field-inner">
+          <input type="email" id="forgot-email" autocomplete="email"
+                 placeholder="agent@autolock.dk" maxlength="255" class="no-right-icon" />
+          <svg class="icon" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
+        </div>
+      </div>
+
+      <button class="submit-btn" id="forgot-btn" type="button">
+        <span class="btn-text">Send nulstillingslink</span>
+        <div class="spinner"></div>
+      </button>
+    </div><!-- /view-forgot -->
+
+  </div><!-- /card -->
+
+  <div class="footer-note">AutoLock Chat &mdash; <span>Intern brug · v2.1</span></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var API_BASE = localStorage.getItem('lc_api_base') || '';
+  var DASHBOARD = 'agent-dashboard-autolock.html';
+
+  // Demo agents (removed when server is configured)
+  var DEMO_AGENTS = [
+    { username: 'admin',  password: 'Admin123!' },
+    { username: 'agent1', password: 'Agent123!' },
+  ];
+
+  // ── Element refs ─────────────────────────────────────────────
+  var usernameEl  = document.getElementById('username');
+  var passwordEl  = document.getElementById('password');
+  var loginBtn    = document.getElementById('login-btn');
+  var bannerLock  = document.getElementById('banner-lock');
+  var bannerError = document.getElementById('banner-error');
+  var bannerWarn  = document.getElementById('banner-warn');
+  var attemptsBar = document.getElementById('attempts-bar');
+  var lockTimer   = document.getElementById('lockout-timer');
+  var showToggle  = document.getElementById('show-toggle');
+  var eyeIcon     = document.getElementById('eye-icon');
+  var card        = document.getElementById('login-card');
+  var urlBar      = document.getElementById('url-bar');
+  var apiInput    = document.getElementById('api-url-input');
+
+  var forgotLinkBtn   = document.getElementById('forgot-link-btn');
+  var backToLogin     = document.getElementById('back-to-login');
+  var forgotEmailEl   = document.getElementById('forgot-email');
+  var forgotBtn       = document.getElementById('forgot-btn');
+  var forgotBannerOk  = document.getElementById('forgot-banner-ok');
+  var forgotBannerErr = document.getElementById('forgot-banner-err');
+
+  var viewLogin  = document.getElementById('view-login');
+  var viewForgot = document.getElementById('view-forgot');
+
+  var Auth = window.AutoLockAuth;
+
+  // ── Already logged in? ──────────────────────────────────────
+  if (Auth.isAuthenticated()) { window.location.href = DASHBOARD; return; }
+
+  // ── Redirect reason ─────────────────────────────────────────
+  var reason = new URLSearchParams(window.location.search).get('reason');
+  if (reason === 'timeout')       showWarn('Din session udløb efter 30 min inaktivitet. Log ind igen.');
+  if (reason === 'unauthorized')  showWarn('Adgang nægtet. Log ind for at fortsætte.');
+
+  // ── Server URL ───────────────────────────────────────────────
+  if (API_BASE) { apiInput.value = API_BASE; urlBar.classList.remove('show'); }
+  else          { urlBar.classList.add('show'); }
+
+  window.saveApiUrl = function () {
+    var val = apiInput.value.trim().replace(/\/$/, '');
+    if (!val) return;
+    localStorage.setItem('lc_api_base', val);
+    API_BASE = val;
+    urlBar.classList.remove('show');
+  };
+  apiInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') window.saveApiUrl(); });
+
+  // ── View switching ───────────────────────────────────────────
+  function showView(name) {
+    viewLogin.classList.toggle('active', name === 'login');
+    viewForgot.classList.toggle('active', name === 'forgot');
+  }
+
+  forgotLinkBtn.addEventListener('click', function () {
+    showView('forgot');
+    forgotEmailEl.focus();
+    forgotBannerOk.classList.remove('show');
+    forgotBannerErr.classList.remove('show');
+  });
+
+  backToLogin.addEventListener('click', function () {
+    showView('login');
+    usernameEl.focus();
+  });
+
+  // ── Lockout ──────────────────────────────────────────────────
+  function checkLockout() {
+    if (Auth.isLockedOut()) { showLockedState(); return true; }
+    hideLockBanner(); return false;
+  }
+  function showLockedState() {
+    bannerLock.classList.add('show');
+    bannerError.classList.remove('show');
+    usernameEl.disabled = passwordEl.disabled = loginBtn.disabled = true;
+    updateLockTimer();
+  }
+  function hideLockBanner() {
+    bannerLock.classList.remove('show');
+    usernameEl.disabled = passwordEl.disabled = loginBtn.disabled = false;
+  }
+  var lockInterval = null;
+  function updateLockTimer() {
+    if (lockInterval) clearInterval(lockInterval);
+    lockInterval = setInterval(function () {
+      var ms = Auth.lockoutRemainingMs();
+      if (ms <= 0) { clearInterval(lockInterval); checkLockout(); renderAttemptDots(0); return; }
+      var min = Math.floor(ms / 60000);
+      var sec = Math.floor((ms % 60000) / 1000);
+      lockTimer.textContent = (min < 10 ? '0' : '') + min + ':' + (sec < 10 ? '0' : '') + sec;
+    }, 500);
+  }
+
+  // ── Attempt dots ─────────────────────────────────────────────
+  function renderAttemptDots(used) {
+    attemptsBar.innerHTML = '';
+    var max = Auth.MAX_LOGIN_ATTEMPTS;
+    for (var i = 0; i < max; i++) {
+      var dot = document.createElement('div');
+      dot.className = 'attempt-dot';
+      if (i < used) dot.classList.add(used >= max - 1 ? 'warn' : 'used');
+      attemptsBar.appendChild(dot);
+    }
+  }
+
+  function showError(msg)  { bannerError.textContent = msg; bannerError.classList.add('show'); bannerWarn.classList.remove('show'); }
+  function showWarn(msg)   { bannerWarn.textContent = msg;  bannerWarn.classList.add('show'); }
+  function clearBanners()  { bannerError.classList.remove('show'); bannerWarn.classList.remove('show'); }
+
+  // ── Init ─────────────────────────────────────────────────────
+  renderAttemptDots(Auth.getAttempts());
+  checkLockout();
+
+  // ── Show/hide password ───────────────────────────────────────
+  showToggle.addEventListener('click', function () {
+    if (passwordEl.type === 'password') {
+      passwordEl.type = 'text';
+      eyeIcon.innerHTML = '<path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27z"/>';
+    } else {
+      passwordEl.type = 'password';
+      eyeIcon.innerHTML = '<path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zm0 12.5c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>';
+    }
+  });
+
+  // ── Enter key ────────────────────────────────────────────────
+  [usernameEl, passwordEl].forEach(function (el) {
+    el.addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+  });
+  forgotEmailEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') doForgot(); });
+
+  loginBtn.addEventListener('click', doLogin);
+  forgotBtn.addEventListener('click', doForgot);
+
+  // ── LOGIN ────────────────────────────────────────────────────
+  function doLogin() {
+    if (checkLockout()) return;
+    var u = usernameEl.value.trim();
+    var p = passwordEl.value;
+    if (!Auth.validateUsername(u)) { showError('Ugyldigt brugernavn. Brug kun bogstaver, tal og @._-'); usernameEl.focus(); return; }
+    if (!Auth.validatePassword(p)) { showError('Adgangskoden skal være mindst 6 tegn.'); passwordEl.focus(); return; }
+
+    clearBanners();
+    loginBtn.classList.add('loading');
+    loginBtn.disabled = true;
+
+    attemptLogin(u, p)
+      .then(function (token) {
+        Auth.login(u, token);
+        loginBtn.classList.remove('loading');
+        loginBtn.querySelector('.btn-text').textContent = '✓ Logger ind...';
+        loginBtn.style.background = 'linear-gradient(135deg,#1a7a3a,#27ae60)';
+        setTimeout(function () { window.location.href = DASHBOARD; }, 500);
+      })
+      .catch(function (msg) {
+        loginBtn.classList.remove('loading');
+        loginBtn.disabled = false;
+        passwordEl.value = '';
+        var result = Auth.recordFailedAttempt();
+        renderAttemptDots(Auth.getAttempts());
+        if (result.locked) {
+          showLockedState();
+        } else {
+          showError(msg + ' (' + result.remaining + ' forsøg tilbage)');
+          card.classList.remove('shake'); void card.offsetWidth; card.classList.add('shake');
+          passwordEl.focus();
+        }
+      });
+  }
+
+  function attemptLogin(username, password) {
+    return new Promise(function (resolve, reject) {
+      if (API_BASE) {
+        fetch(API_BASE + '/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': Auth.getCsrfToken() },
+          body: JSON.stringify({ username: username, password: password }),
+          credentials: 'same-origin',
+        })
+        .then(function (r) {
+          if (r.status === 429) throw new Error('rate_limit');
+          return r.json();
+        })
+        .then(function (data) {
+          if (data.token) resolve(data.token);
+          else reject(data.error || 'Forkert brugernavn eller adgangskode.');
+        })
+        .catch(function (e) {
+          if (e.message === 'rate_limit') reject('For mange forsøg. Server afviste login.');
+          else reject('Forkert brugernavn eller adgangskode.');
+        });
+      } else {
+        // Demo fallback
+        setTimeout(function () {
+          var match = DEMO_AGENTS.find(function (a) { return a.username === username && a.password === password; });
+          if (match) resolve('demo-token-' + Auth.generateToken(16));
+          else reject('Forkert brugernavn eller adgangskode.');
+        }, 600 + Math.random() * 200);
+      }
+    });
+  }
+
+  // ── FORGOT PASSWORD ──────────────────────────────────────────
+  function doForgot() {
+    var email = forgotEmailEl.value.trim().toLowerCase();
+    forgotBannerOk.classList.remove('show');
+    forgotBannerErr.classList.remove('show');
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      forgotBannerErr.textContent = 'Indtast en gyldig email-adresse.';
+      forgotBannerErr.classList.add('show');
+      forgotEmailEl.focus();
+      return;
+    }
+
+    forgotBtn.classList.add('loading');
+    forgotBtn.disabled = true;
+
+    if (API_BASE) {
+      fetch(API_BASE + '/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': Auth.getCsrfToken() },
+        body: JSON.stringify({ email: email }),
+      })
+      .then(function (r) { return r.json(); })
+      .then(function () {
+        // Always show success (server never reveals if email exists)
+        forgotBtn.classList.remove('loading');
+        forgotBtn.disabled = false;
+        forgotBannerOk.textContent = '✓ Hvis emailen er registreret, er der sendt et link. Tjek din indbakke (og spam-mappe).';
+        forgotBannerOk.classList.add('show');
+        forgotEmailEl.value = '';
+      })
+      .catch(function () {
+        forgotBtn.classList.remove('loading');
+        forgotBtn.disabled = false;
+        forgotBannerErr.textContent = 'Kunne ikke sende. Tjek serverforbindelsen og prøv igen.';
+        forgotBannerErr.classList.add('show');
+      });
+    } else {
+      // Demo mode
+      setTimeout(function () {
+        forgotBtn.classList.remove('loading');
+        forgotBtn.disabled = false;
+        forgotBannerOk.textContent = '✓ [Demo] Ingen server tilsluttet — i produktion sendes et nulstillingslink til ' + email + '.';
+        forgotBannerOk.classList.add('show');
+        forgotEmailEl.value = '';
+      }, 800);
+    }
+  }
+
+})();
+</script>
+</body>
+</html>
