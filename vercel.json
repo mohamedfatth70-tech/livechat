@@ -1,13 +1,14 @@
 {
   "version": 2,
   "builds": [
-    { "src": "index-autolock.js", "use": "@vercel/node" }
+    { "src": "index-autolock.js", "use": "@vercel/node" },
+    { "src": "*.html", "use": "@vercel/static" },
+    { "src": "*.js", "use": "@vercel/static" }
   ],
   "routes": [
-    { "src": "/", "dest": "/public/login.html" },
-    { "src": "/agent-dashboard-autolock.html", "dest": "/public/agent-dashboard-autolock.html" },
-    { "src": "/auth.js", "dest": "/public/auth.js" },
-    { "src": "/msal-browser.min.js", "dest": "/public/msal-browser.min.js" },
+    { "src": "/", "dest": "/login.html" },
+    { "src": "/(.*\\.html$)", "dest": "/$1" },
+    { "src": "/(.*\\.js$)", "dest": "/$1" },
     { "src": "/(.*)", "dest": "/index-autolock.js" }
   ]
 }
