@@ -469,6 +469,10 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'login.html'));
+});
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 const port = CONFIG.port;
 app.listen(port, () => {
