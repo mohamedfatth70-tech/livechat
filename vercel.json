@@ -1,27 +1,9 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "index-autolock.js",
-      "use": "@vercel/node"
-    }
+    { "src": "index-autolock.js", "use": "@vercel/node" }
   ],
   "routes": [
-    {
-      "src": "/",
-      "dest": "/login.html"
-    },
-    {
-      "src": "/(.*\\.html)",
-      "dest": "/$1"
-    },
-    {
-      "src": "/(.*\\.js)",
-      "dest": "/$1"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/index-autolock.js"
-    }
+    { "src": "/(.*)", "dest": "/index-autolock.js" }
   ]
 }
