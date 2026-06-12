@@ -48,6 +48,7 @@ const express  = require('express');
 const https    = require('https');
 const crypto   = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const path = require('path');
 
 // ─── Konfiguration ────────────────────────────────────────────────────────────
 
@@ -277,7 +278,7 @@ function parseAgentReply(raw) {
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // CORS – kun kendte origins
 app.use((req, res, next) => {
