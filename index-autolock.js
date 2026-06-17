@@ -381,21 +381,22 @@ app.post('/webhook/teams', async (req, res) => {
   const parsed = parseAgentReply(raw);
   if (!parsed) return res.json({ ignored: true, reason: 'Ikke et !svar-kommando' });
 
-  // Find session via short ID
   const { data: sessions } = await supabase
     .from('sessions').select('*').eq('status', 'open').ilike('id', `${parsed.shortId}%`).limit(1);
   const session = sessions?.[0];
   if (!session) return res.json({ ignored: true, reason: 'Session ikke fundet' });
 
-  const textForCustomer = parsed.message;
+  const rawMessage      = parsed.message;
+  const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
 
   const { data: msg, error } = await supabase
-    .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer })
+    .from('messages')
+    .insert({ session_id: session.id, role: 'agent', text: textForCustomer })
     .select().single();
   if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
   clearReminder(session.id);
-  sseBroadcast(session.id, 'message', msg); // push til widget via SSE
+  sseBroadcast(session.id, 'message', { ...msg, originalText: rawMessage });
   res.json({ saved: true, message: msg });
 });
 
@@ -450,17 +451,17 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  const rawMessage = sanitizeText(message, 2000);
-  // Oversæt agentens svar til kundens valgte sprog
+  const rawMessage      = sanitizeText(message, 2000);
   const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
 
   const { data: msg, error: msgErr } = await supabase
-    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
+    .from('messages')
+    .insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
     .select().single();
   if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
   clearReminder(sessionId);
-  sseBroadcast(sessionId, 'message', msg);
+  sseBroadcast(sessionId, 'message', { ...msg, originalText: rawMessage });
   res.json({ message: msg });
 });
 
