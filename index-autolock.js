@@ -1,47 +1,3 @@
-/**
- * AutoLock Livechat – Vercel + Supabase
- *
- * Ændringer fra original:
- *  - In-memory Map() erstattet med Supabase (PostgreSQL)
- *  - Long-polling erstattet med Server-Sent Events (SSE)
- *  - Rate limiting på /session/start og /message/send
- *  - Auth-middleware på agent-endpoints (/sessions, /messages, /agent/reply)
- *  - CORS begrænset til kendte domæner via ALLOWED_ORIGINS env-variabel
- *  - Input-validering og maks-længder på alle endpoints
- *  - Webhook-secret valideres altid (ingen usikker fallback)
- *
- * Supabase tabeller (kør i Supabase SQL editor):
- * ─────────────────────────────────────────────
- * CREATE TABLE sessions (
- *   id          TEXT PRIMARY KEY,
- *   name        TEXT NOT NULL,
- *   email       TEXT,
- *   phone       TEXT,
- *   lang        TEXT DEFAULT 'da',
- *   status      TEXT DEFAULT 'open',
- *   created_at  TIMESTAMPTZ DEFAULT now()
- * );
- *
- * CREATE TABLE messages (
- *   id          BIGSERIAL PRIMARY KEY,
- *   session_id  TEXT REFERENCES sessions(id),
- *   role        TEXT NOT NULL,  -- 'customer' eller 'agent'
- *   text        TEXT NOT NULL,
- *   created_at  TIMESTAMPTZ DEFAULT now()
- * );
- *
- * CREATE INDEX ON messages(session_id, id);
- * ─────────────────────────────────────────────
- *
- * Miljøvariabler (sæt i Vercel dashboard):
- *   SUPABASE_URL          – Fra Supabase → Project Settings → API
- *   SUPABASE_SERVICE_KEY  – Fra Supabase → Project Settings → API (service_role nøgle)
- *   WEBHOOK_SECRET        – Hemmeligt token delt med Power Automate
- *   AGENT_SECRET          – Hemmeligt token til agent-dashboard (sæt samme i agent-dashboard HTML)
- *   TEAMS_WEBHOOK_URL     – Power Automate webhook URL
- *   ALLOWED_ORIGINS       – Kommasepareret: https://autolock.dk,https://autolock.se,...
- */
-
 'use strict';
 
 const express  = require('express');
@@ -340,15 +296,19 @@ app.post('/message/send',
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    const textForAgent = text;
-
+    // Gem både original og oversatt tekst (for customer messages er de ens)
     const { data: msg, error: msgErr } = await supabase
-      .from('messages').insert({ session_id: sessionId, role: 'customer', text: textForAgent })
+      .from('messages').insert({ 
+        session_id: sessionId, 
+        role: 'customer', 
+        text: text, 
+        text_original: text 
+      })
       .select().single();
     if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
     scheduleReminder(session);
-    await sendToTeams(sessionId, session.name, textForAgent);
+    await sendToTeams(sessionId, session.name, text);
 
     res.json({ message: msg });
   }
@@ -391,12 +351,17 @@ app.post('/webhook/teams', async (req, res) => {
 
   const { data: msg, error } = await supabase
     .from('messages')
-    .insert({ session_id: session.id, role: 'agent', text: textForCustomer })
+    .insert({ 
+      session_id: session.id, 
+      role: 'agent', 
+      text: textForCustomer,
+      text_original: rawMessage 
+    })
     .select().single();
   if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
   clearReminder(session.id);
-  sseBroadcast(session.id, 'message', { ...msg, originalText: rawMessage });
+  sseBroadcast(session.id, 'message', { ...msg, text: textForCustomer, originalText: rawMessage });
   res.json({ saved: true, message: msg });
 });
 
@@ -456,12 +421,17 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
 
   const { data: msg, error: msgErr } = await supabase
     .from('messages')
-    .insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
+    .insert({ 
+      session_id: sessionId, 
+      role: 'agent', 
+      text: textForCustomer,
+      text_original: rawMessage 
+    })
     .select().single();
   if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
   clearReminder(sessionId);
-  sseBroadcast(sessionId, 'message', { ...msg, originalText: rawMessage });
+  sseBroadcast(sessionId, 'message', { ...msg, text: textForCustomer, originalText: rawMessage });
   res.json({ message: msg });
 });
 
