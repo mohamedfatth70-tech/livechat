@@ -1,3 +1,49 @@
+/**
+ * AutoLock Livechat – Vercel + Supabase
+ *
+ * Ændringer fra original:
+ *  - In-memory Map() erstattet med Supabase (PostgreSQL)
+ *  - Long-polling erstattet med Server-Sent Events (SSE)
+ *  - Rate limiting på /session/start og /message/send
+ *  - Auth-middleware på agent-endpoints (/sessions, /messages, /agent/reply)
+ *  - CORS begrænset til kendte domæner via ALLOWED_ORIGINS env-variabel
+ *  - Input-validering og maks-længder på alle endpoints
+ *  - Webhook-secret valideres altid (ingen usikker fallback)
+ *
+ * Supabase tabeller (kør i Supabase SQL editor):
+ * ─────────────────────────────────────────────
+ * CREATE TABLE sessions (
+ *   id          TEXT PRIMARY KEY,
+ *   name        TEXT NOT NULL,
+ *   email       TEXT,
+ *   phone       TEXT,
+ *   lang        TEXT DEFAULT 'da',
+ *   status      TEXT DEFAULT 'open',
+ *   created_at  TIMESTAMPTZ DEFAULT now()
+ * );
+ *
+ * CREATE TABLE messages (
+ *   id             BIGSERIAL PRIMARY KEY,
+ *   session_id     TEXT REFERENCES sessions(id),
+ *   role           TEXT NOT NULL,  -- 'customer' eller 'agent'
+ *   text           TEXT NOT NULL, -- altid dansk (det agenten læser/skriver)
+ *   original_text  TEXT,          -- kundens rå tekst før oversættelse (kun role='customer')
+ *   original_lang  TEXT,          -- sprogkode for original_text, f.eks. 'en' (NULL hvis dansk)
+ *   created_at     TIMESTAMPTZ DEFAULT now()
+ * );
+ *
+ * CREATE INDEX ON messages(session_id, id);
+ * ─────────────────────────────────────────────
+ *
+ * Miljøvariabler (sæt i Vercel dashboard):
+ *   SUPABASE_URL          – Fra Supabase → Project Settings → API
+ *   SUPABASE_SERVICE_KEY  – Fra Supabase → Project Settings → API (service_role nøgle)
+ *   WEBHOOK_SECRET        – Hemmeligt token delt med Power Automate
+ *   AGENT_SECRET          – Hemmeligt token til agent-dashboard (sæt samme i agent-dashboard HTML)
+ *   TEAMS_WEBHOOK_URL     – Power Automate webhook URL
+ *   ALLOWED_ORIGINS       – Kommasepareret: https://autolock.dk,https://autolock.se,...
+ */
+
 'use strict';
 
 const express  = require('express');
@@ -130,9 +176,10 @@ async function detectAndTranslateToDanish(text) {
 }
 
 async function translateToCustomerLang(text, targetLang) {
-  if (!text?.trim() || !targetLang || targetLang === 'da') return text;
+  const target = sanitizeLang(targetLang);
+  if (!text?.trim() || !target || target === 'da') return text;
   try {
-    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${targetLang}`);
+    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${target}`);
     const json = JSON.parse(raw);
     return json.responseData?.translatedText || text;
   } catch { return text; }
@@ -292,7 +339,8 @@ app.post('/message/send',
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    const { translated: textForAgent, detectedLang } = await detectAndTranslateToDanish(text);
+    const { translated: textForAgent, detectedLang: rawDetectedLang } = await detectAndTranslateToDanish(text);
+    const detectedLang = sanitizeLang(rawDetectedLang);
 
     // Opdater sprog på sessionen hvis auto-detektion finder et ikke-dansk sprog
     if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
@@ -300,8 +348,20 @@ app.post('/message/send',
       session.lang = detectedLang;
     }
 
+    // Gem kundens originaltekst ved siden af den danske oversættelse, så agenten
+    // kan skifte tilbage til originalen i dashboardet. Kun relevant hvis kunden
+    // faktisk skrev på et andet sprog end dansk.
+    const isTranslated = detectedLang !== 'da' && textForAgent !== text;
+    const insertRow = {
+      session_id: sessionId,
+      role: 'customer',
+      text: textForAgent,
+      original_text: isTranslated ? text : null,
+      original_lang: isTranslated ? detectedLang : null,
+    };
+
     const { data: msg, error: msgErr } = await supabase
-      .from('messages').insert({ session_id: sessionId, role: 'customer', text: textForAgent })
+      .from('messages').insert(insertRow)
       .select().single();
     if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
@@ -418,6 +478,21 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   clearReminder(sessionId);
   sseBroadcast(sessionId, 'message', msg);
   res.json({ message: msg });
+});
+
+// POST /agent/translate – overstaet en enkelt tekst on-demand til agentens dashboard
+// (f.eks. "vis denne besked på engelsk" for en kollega, eller gen-oversæt hvis
+// auto-detektion ved modtagelse gik forkert). Skriver ikke til databasen.
+app.post('/agent/translate', requireAgentAuth, async (req, res) => {
+  const text = sanitizeText(req.body.text || '', 2000);
+  const targetLang = sanitizeLang(req.body.targetLang);
+  if (!text) return res.status(400).json({ error: 'text kræves' });
+
+  const translated = targetLang === 'da'
+    ? await detectAndTranslateToDanish(text).then(r => r.translated)
+    : await translateToCustomerLang(text, targetLang);
+
+  res.json({ translated, targetLang });
 });
 
 // ── GET /health ───────────────────────────────────────────────────────────────
