@@ -290,8 +290,8 @@
   var sessions = {};          // id -> { id, name, email, phone, status, messages: [], unread: 0 }
   var activeSessionId = null;
   var LANG_NAMES = { da: 'Dansk', sv: 'Svensk', de: 'Tysk', en: 'Engelsk', nb: 'Norsk', fi: 'Finsk', nl: 'Nederlandsk', fr: 'Fransk', es: 'Spansk', pl: 'Polsk' };
-  // Husker hvilke beskeder der pt. viser original-sprog i stedet for dansk, og evt. on-demand-oversættelser
-  var showOriginal = {};      // msgKey -> true/false
+  // Husker hvilken sprog-visning hver kundebesked viser pt: 'da' (standard), 'original', eller en sprogkode ('en' osv. for on-demand-oversættelser)
+  var viewState = {};         // msgKey -> 'da' | 'original' | langCode
   var onDemandTranslations = {}; // msgKey -> { lang: text }
   // Hent agentens navn fra auth (AutoLockAuth eller MSAL)
   var AGENT_NAME = (typeof AutoLockAuth !== 'undefined' && AutoLockAuth.getUsername && AutoLockAuth.getUsername()) || 'Agent';
@@ -614,16 +614,26 @@
     toggleBtn.className = 'translate-toggle-btn';
 
     function render() {
-      var isShowingOriginal = !!showOriginal[key];
-      badge.textContent = isShowingOriginal
-        ? (LANG_NAMES[msg.original_lang] || msg.original_lang.toUpperCase())
-        : 'DA';
-      toggleBtn.textContent = isShowingOriginal ? 'Vis dansk' : 'Vis original';
-      textDiv.textContent = isShowingOriginal ? msg.original_text : msg.text;
+      var state = viewState[key] || 'da';
+      if (state === 'da') {
+        badge.textContent = 'DA';
+        toggleBtn.textContent = 'Vis original';
+        textDiv.textContent = msg.text;
+      } else if (state === 'original') {
+        badge.textContent = LANG_NAMES[msg.original_lang] || msg.original_lang.toUpperCase();
+        toggleBtn.textContent = 'Vis dansk';
+        textDiv.textContent = msg.original_text;
+      } else {
+        // on-demand-oversat sprog
+        badge.textContent = LANG_NAMES[state] || state.toUpperCase();
+        toggleBtn.textContent = 'Vis dansk';
+        textDiv.textContent = (onDemandTranslations[key] && onDemandTranslations[key][state]) || msg.text;
+      }
     }
 
     toggleBtn.addEventListener('click', function() {
-      showOriginal[key] = !showOriginal[key];
+      // Fra dansk -> vis original. Fra original ELLER et on-demand-sprog -> tilbage til dansk.
+      viewState[key] = (viewState[key] || 'da') === 'da' ? 'original' : 'da';
       render();
     });
 
@@ -633,7 +643,7 @@
     moreBtn.title = 'Oversæt til andet sprog';
     moreBtn.addEventListener('click', function() {
       openLangPicker(moreBtn, function(lang) {
-        translateOnDemand(msg, lang, textDiv, badge, toggleBtn);
+        translateOnDemand(msg, lang, toggleBtn, render);
       });
     });
 
@@ -685,18 +695,17 @@
 
   // Kalder /agent/translate for at oversætte en kundebesked on-demand til et valgt sprog.
   // Caches resultatet i onDemandTranslations, så vi ikke spørger MyMemory igen ved gentagne klik.
-  function translateOnDemand(msg, lang, textDiv, badge, toggleBtn) {
+  function translateOnDemand(msg, lang, toggleBtn, render) {
     var key = msgKey(msg);
     var cached = onDemandTranslations[key] && onDemandTranslations[key][lang];
     if (cached) {
-      showOriginal[key] = false; // nulstil toggle-state, vi viser nu en helt anden visning
-      textDiv.textContent = cached;
-      badge.textContent = LANG_NAMES[lang] || lang.toUpperCase();
-      toggleBtn.textContent = 'Vis dansk';
+      viewState[key] = lang;
+      render();
       return;
     }
 
     var sourceText = msg.original_text || msg.text;
+    var prevLabel = toggleBtn.textContent;
     toggleBtn.disabled = true;
     toggleBtn.textContent = 'Oversætter…';
 
@@ -708,17 +717,15 @@
       .then(function(r) { return r.json(); })
       .then(function(data) {
         toggleBtn.disabled = false;
-        if (!data.translated) { showToast('Oversættelse mislykkedes'); toggleBtn.textContent = 'Vis original'; return; }
+        if (!data.translated) { showToast('Oversættelse mislykkedes'); toggleBtn.textContent = prevLabel; return; }
         onDemandTranslations[key] = onDemandTranslations[key] || {};
         onDemandTranslations[key][lang] = data.translated;
-        showOriginal[key] = false;
-        textDiv.textContent = data.translated;
-        badge.textContent = LANG_NAMES[lang] || lang.toUpperCase();
-        toggleBtn.textContent = 'Vis dansk';
+        viewState[key] = lang;
+        render();
       })
       .catch(function() {
         toggleBtn.disabled = false;
-        toggleBtn.textContent = 'Vis original';
+        toggleBtn.textContent = prevLabel;
         showToast('Oversættelse mislykkedes');
       });
   }
