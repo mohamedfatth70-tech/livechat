@@ -156,6 +156,24 @@
   .msg-agent { align-self: flex-end; background: linear-gradient(135deg, var(--red) 0%, var(--red-soft) 100%); color: #fff; font-weight: 500; border-bottom-right-radius: 3px; box-shadow: 0 2px 8px rgba(192,57,43,0.35); }
   .msg-system { align-self: center; font-size: 11.5px; color: var(--text-mute); padding: 2px 0; }
 
+  .msg-translate-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; padding: 0 2px; align-self: flex-start; }
+  .lang-badge {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+    color: var(--text-dim); background: var(--bg3);
+    border: 1px solid var(--border2); border-radius: 4px;
+    padding: 1px 5px; text-transform: uppercase;
+  }
+  .translate-toggle-btn {
+    font-size: 11px; font-weight: 600; color: var(--red-soft);
+    background: none; border: none; cursor: pointer;
+    padding: 1px 2px; text-decoration: underline;
+    text-decoration-color: transparent;
+    transition: text-decoration-color 0.15s;
+  }
+  .translate-toggle-btn:hover { text-decoration-color: var(--red-soft); }
+  .translate-toggle-btn:disabled { color: var(--text-mute); cursor: wait; text-decoration: none; }
+  .msg-original-note { font-size: 11px; color: var(--text-mute); font-style: italic; margin-top: 3px; }
+
   #no-chat {
     flex: 1; display: flex; align-items: center;
     justify-content: center; flex-direction: column;
@@ -271,6 +289,10 @@
   var AGENT_SECRET = 'p2nh7wqt5xm3rvkd8bjyfe6lcs4aguoz';
   var sessions = {};          // id -> { id, name, email, phone, status, messages: [], unread: 0 }
   var activeSessionId = null;
+  var LANG_NAMES = { da: 'Dansk', sv: 'Svensk', de: 'Tysk', en: 'Engelsk', nb: 'Norsk', fi: 'Finsk', nl: 'Nederlandsk', fr: 'Fransk', es: 'Spansk', pl: 'Polsk' };
+  // Husker hvilke beskeder der pt. viser original-sprog i stedet for dansk, og evt. on-demand-oversættelser
+  var showOriginal = {};      // msgKey -> true/false
+  var onDemandTranslations = {}; // msgKey -> { lang: text }
   // Hent agentens navn fra auth (AutoLockAuth eller MSAL)
   var AGENT_NAME = (typeof AutoLockAuth !== 'undefined' && AutoLockAuth.getUsername && AutoLockAuth.getUsername()) || 'Agent';
   var agentBadge = document.getElementById('agent-name-badge');
@@ -568,9 +590,137 @@
 
       wrap.appendChild(label);
       wrap.appendChild(div);
+
+      // Kun kundebeskeder, der faktisk var på et andet sprog end dansk, får badge + knap
+      if (msg.role === 'customer' && msg.original_lang) {
+        wrap.appendChild(buildTranslateRow(msg, div));
+      }
     }
 
     messagesEl.appendChild(wrap);
+  }
+
+  // Bygger badge + "Vis original/Vis dansk"-knap-rækken under en kundebesked,
+  // og opdaterer selve beskedteksten (textDiv) når agenten skifter visning.
+  function buildTranslateRow(msg, textDiv) {
+    var key = msgKey(msg);
+    var row = document.createElement('div');
+    row.className = 'msg-translate-row';
+
+    var badge = document.createElement('span');
+    badge.className = 'lang-badge';
+
+    var toggleBtn = document.createElement('button');
+    toggleBtn.className = 'translate-toggle-btn';
+
+    function render() {
+      var isShowingOriginal = !!showOriginal[key];
+      badge.textContent = isShowingOriginal
+        ? (LANG_NAMES[msg.original_lang] || msg.original_lang.toUpperCase())
+        : 'DA';
+      toggleBtn.textContent = isShowingOriginal ? 'Vis dansk' : 'Vis original';
+      textDiv.textContent = isShowingOriginal ? msg.original_text : msg.text;
+    }
+
+    toggleBtn.addEventListener('click', function() {
+      showOriginal[key] = !showOriginal[key];
+      render();
+    });
+
+    var moreBtn = document.createElement('button');
+    moreBtn.className = 'translate-toggle-btn';
+    moreBtn.textContent = '⋯';
+    moreBtn.title = 'Oversæt til andet sprog';
+    moreBtn.addEventListener('click', function() {
+      openLangPicker(moreBtn, function(lang) {
+        translateOnDemand(msg, lang, textDiv, badge, toggleBtn);
+      });
+    });
+
+    render();
+    row.appendChild(badge);
+    row.appendChild(toggleBtn);
+    row.appendChild(moreBtn);
+    return row;
+  }
+
+  // Lille dropdown med sprogvalg, vist lige under den klikkede knap.
+  function openLangPicker(anchorEl, onPick) {
+    var existing = document.getElementById('lang-picker');
+    if (existing) existing.remove();
+
+    var picker = document.createElement('div');
+    picker.id = 'lang-picker';
+    picker.style.cssText = 'position:absolute;background:var(--bg3);border:1px solid var(--border2);' +
+      'border-radius:8px;padding:4px;box-shadow:0 4px 16px rgba(0,0,0,0.4);z-index:50;display:flex;flex-direction:column;min-width:110px;';
+
+    Object.keys(LANG_NAMES).forEach(function(code) {
+      var item = document.createElement('button');
+      item.textContent = LANG_NAMES[code];
+      item.style.cssText = 'background:none;border:none;color:var(--text);font-size:12px;text-align:left;' +
+        'padding:6px 8px;border-radius:5px;cursor:pointer;';
+      item.addEventListener('mouseenter', function() { this.style.background = 'var(--bg4)'; });
+      item.addEventListener('mouseleave', function() { this.style.background = 'none'; });
+      item.addEventListener('click', function(e) {
+        e.stopPropagation();
+        picker.remove();
+        onPick(code);
+      });
+      picker.appendChild(item);
+    });
+
+    var rect = anchorEl.getBoundingClientRect();
+    picker.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+    picker.style.left = (rect.left + window.scrollX) + 'px';
+    document.body.appendChild(picker);
+
+    function closeOnOutsideClick(e) {
+      if (!picker.contains(e.target)) {
+        picker.remove();
+        document.removeEventListener('click', closeOnOutsideClick);
+      }
+    }
+    setTimeout(function() { document.addEventListener('click', closeOnOutsideClick); }, 0);
+  }
+
+  // Kalder /agent/translate for at oversætte en kundebesked on-demand til et valgt sprog.
+  // Caches resultatet i onDemandTranslations, så vi ikke spørger MyMemory igen ved gentagne klik.
+  function translateOnDemand(msg, lang, textDiv, badge, toggleBtn) {
+    var key = msgKey(msg);
+    var cached = onDemandTranslations[key] && onDemandTranslations[key][lang];
+    if (cached) {
+      showOriginal[key] = false; // nulstil toggle-state, vi viser nu en helt anden visning
+      textDiv.textContent = cached;
+      badge.textContent = LANG_NAMES[lang] || lang.toUpperCase();
+      toggleBtn.textContent = 'Vis dansk';
+      return;
+    }
+
+    var sourceText = msg.original_text || msg.text;
+    toggleBtn.disabled = true;
+    toggleBtn.textContent = 'Oversætter…';
+
+    fetch(API_BASE + '/agent/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
+      body: JSON.stringify({ text: sourceText, targetLang: lang })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        toggleBtn.disabled = false;
+        if (!data.translated) { showToast('Oversættelse mislykkedes'); toggleBtn.textContent = 'Vis original'; return; }
+        onDemandTranslations[key] = onDemandTranslations[key] || {};
+        onDemandTranslations[key][lang] = data.translated;
+        showOriginal[key] = false;
+        textDiv.textContent = data.translated;
+        badge.textContent = LANG_NAMES[lang] || lang.toUpperCase();
+        toggleBtn.textContent = 'Vis dansk';
+      })
+      .catch(function() {
+        toggleBtn.disabled = false;
+        toggleBtn.textContent = 'Vis original';
+        showToast('Oversættelse mislykkedes');
+      });
   }
 
   function scrollMessages() {
