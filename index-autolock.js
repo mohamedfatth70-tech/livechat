@@ -450,7 +450,9 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  const textForCustomer = sanitizeText(message, 2000);
+  const rawMessage = sanitizeText(message, 2000);
+  // Oversæt agentens svar til kundens valgte sprog
+  const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
 
   const { data: msg, error: msgErr } = await supabase
     .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
