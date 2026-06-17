@@ -593,8 +593,8 @@
       wrap.appendChild(div);
 
       // Kun kundebeskeder, der faktisk var på et andet sprog end dansk, får badge + knap
-      if (msg.role === 'customer' && msg.original_lang) {
-        wrap.appendChild(buildTranslateRow(msg, div));
+     if (msg.role === 'customer') {
+    wrap.appendChild(buildTranslateRow(msg, div));
       }
     }
 
