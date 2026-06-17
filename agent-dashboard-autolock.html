@@ -444,7 +444,7 @@
       var sd = sessions[s.id];
       var msgs = sd ? sd.messages : [];
       var last = msgs.length ? msgs[msgs.length - 1] : null;
-      var preview = last ? last.text : 'Chat startet';
+      var preview = last ? (last.text_original || last.text) : 'Chat startet';
       var hasUnread = sd && sd.unread > 0;
       var isClosed = s.status !== 'open';
       var initials = s.name.split(' ').map(function(w) { return w[0]; }).join('').toUpperCase().slice(0, 2);
@@ -552,7 +552,7 @@
             added = true;
             if (m.role === 'customer' && sessionId !== activeSessionId) {
               s.unread++;
-              showToast((s.name || 'Kunde') + ': ' + m.text.slice(0, 60));
+              showToast((s.name || 'Kunde') + ': ' + (m.text_original || m.text).slice(0, 60));
             }
           }
         });
@@ -568,7 +568,7 @@
   }
 
   function msgKey(m) {
-    return (m.id || '') + '|' + (m.role || '') + '|' + (m.text || '').slice(0, 40);
+    return (m.id || '') + '|' + (m.role || '') + '|' + ((m.text_original || m.text) || '').slice(0, 40);
   }
 
   function appendMessageEl(msg, customerName) {
@@ -587,7 +587,7 @@
 
       var div = document.createElement('div');
       div.className = 'msg msg-' + msg.role;
-      div.textContent = msg.text;
+      div.textContent = msg.text_original || msg.text;
 
       wrap.appendChild(label);
       wrap.appendChild(div);
