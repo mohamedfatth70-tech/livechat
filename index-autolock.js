@@ -174,9 +174,10 @@ async function detectAndTranslateToDanish(text) {
 }
 
 async function translateToCustomerLang(text, targetLang) {
-  if (!text?.trim() || !targetLang || targetLang === 'da') return text;
+  const target = sanitizeLang(targetLang);
+  if (!text?.trim() || !target || target === 'da') return text;
   try {
-    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${targetLang}`);
+    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${target}`);
     const json = JSON.parse(raw);
     return json.responseData?.translatedText || text;
   } catch { return text; }
@@ -336,7 +337,8 @@ app.post('/message/send',
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    const { translated: textForAgent, detectedLang } = await detectAndTranslateToDanish(text);
+    const { translated: textForAgent, detectedLang: rawDetectedLang } = await detectAndTranslateToDanish(text);
+    const detectedLang = sanitizeLang(rawDetectedLang);
 
     // Opdater sprog på sessionen hvis auto-detektion finder et ikke-dansk sprog
     if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
