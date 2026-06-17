@@ -23,13 +23,11 @@
  * );
  *
  * CREATE TABLE messages (
- *   id             BIGSERIAL PRIMARY KEY,
- *   session_id     TEXT REFERENCES sessions(id),
- *   role           TEXT NOT NULL,  -- 'customer' eller 'agent'
- *   text           TEXT NOT NULL, -- altid dansk (det agenten læser/skriver)
- *   original_text  TEXT,          -- kundens rå tekst før oversættelse (kun role='customer')
- *   original_lang  TEXT,          -- sprogkode for original_text, f.eks. 'en' (NULL hvis dansk)
- *   created_at     TIMESTAMPTZ DEFAULT now()
+ *   id          BIGSERIAL PRIMARY KEY,
+ *   session_id  TEXT REFERENCES sessions(id),
+ *   role        TEXT NOT NULL,  -- 'customer' eller 'agent'
+ *   text        TEXT NOT NULL,
+ *   created_at  TIMESTAMPTZ DEFAULT now()
  * );
  *
  * CREATE INDEX ON messages(session_id, id);
@@ -168,18 +166,21 @@ async function detectAndTranslateToDanish(text) {
   try {
     const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=autodetect|da`);
     const json = JSON.parse(raw);
+    const detected = (json.matches?.[0]?.source || json.responseData?.match?.source || 'da').toLowerCase();
+    if (detected === 'da') {
+      return { translated: text, detectedLang: 'da' };
+    }
     return {
       translated:   json.responseData?.translatedText || text,
-      detectedLang: json.matches?.[0]?.source || 'da',
+      detectedLang: detected,
     };
   } catch { return { translated: text, detectedLang: 'da' }; }
 }
 
 async function translateToCustomerLang(text, targetLang) {
-  const target = sanitizeLang(targetLang);
-  if (!text?.trim() || !target || target === 'da') return text;
+  if (!text?.trim() || !targetLang || targetLang === 'da') return text;
   try {
-    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${target}`);
+    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${targetLang}`);
     const json = JSON.parse(raw);
     return json.responseData?.translatedText || text;
   } catch { return text; }
@@ -339,29 +340,10 @@ app.post('/message/send',
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    const { translated: textForAgent, detectedLang: rawDetectedLang } = await detectAndTranslateToDanish(text);
-    const detectedLang = sanitizeLang(rawDetectedLang);
-
-    // Opdater sprog på sessionen hvis auto-detektion finder et ikke-dansk sprog
-    if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
-      await supabase.from('sessions').update({ lang: detectedLang }).eq('id', sessionId);
-      session.lang = detectedLang;
-    }
-
-    // Gem kundens originaltekst ved siden af den danske oversættelse, så agenten
-    // kan skifte tilbage til originalen i dashboardet. Kun relevant hvis kunden
-    // faktisk skrev på et andet sprog end dansk.
-    const isTranslated = detectedLang !== 'da' && textForAgent !== text;
-    const insertRow = {
-      session_id: sessionId,
-      role: 'customer',
-      text: textForAgent,
-      original_text: isTranslated ? text : null,
-      original_lang: isTranslated ? detectedLang : null,
-    };
+    const textForAgent = text;
 
     const { data: msg, error: msgErr } = await supabase
-      .from('messages').insert(insertRow)
+      .from('messages').insert({ session_id: sessionId, role: 'customer', text: textForAgent })
       .select().single();
     if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
@@ -405,7 +387,7 @@ app.post('/webhook/teams', async (req, res) => {
   const session = sessions?.[0];
   if (!session) return res.json({ ignored: true, reason: 'Session ikke fundet' });
 
-  const textForCustomer = await translateToCustomerLang(parsed.message, session.lang || 'da');
+  const textForCustomer = parsed.message;
 
   const { data: msg, error } = await supabase
     .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer })
@@ -468,7 +450,7 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  const textForCustomer = await translateToCustomerLang(sanitizeText(message, 2000), session.lang || 'da');
+  const textForCustomer = sanitizeText(message, 2000);
 
   const { data: msg, error: msgErr } = await supabase
     .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
@@ -480,19 +462,16 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   res.json({ message: msg });
 });
 
-// POST /agent/translate – overstaet en enkelt tekst on-demand til agentens dashboard
-// (f.eks. "vis denne besked på engelsk" for en kollega, eller gen-oversæt hvis
-// auto-detektion ved modtagelse gik forkert). Skriver ikke til databasen.
+// POST /agent/translate – manuel oversættelse fra dashboard
 app.post('/agent/translate', requireAgentAuth, async (req, res) => {
-  const text = sanitizeText(req.body.text || '', 2000);
+  const text       = sanitizeText(req.body.text || '', 2000);
   const targetLang = sanitizeLang(req.body.targetLang);
-  if (!text) return res.status(400).json({ error: 'text kræves' });
 
-  const translated = targetLang === 'da'
-    ? await detectAndTranslateToDanish(text).then(r => r.translated)
-    : await translateToCustomerLang(text, targetLang);
+  if (!text) return res.status(400).json({ error: 'Text is required' });
+  if (!req.body.targetLang) return res.status(400).json({ error: 'targetLang is required' });
 
-  res.json({ translated, targetLang });
+  const translated = await translateToCustomerLang(text, targetLang);
+  res.json({ translated });
 });
 
 // ── GET /health ───────────────────────────────────────────────────────────────
