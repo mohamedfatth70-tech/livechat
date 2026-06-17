@@ -592,9 +592,9 @@
       wrap.appendChild(label);
       wrap.appendChild(div);
 
-      // Kun kundebeskeder, der faktisk var på et andet sprog end dansk, får badge + knap
-     if (msg.role === 'customer') {
-    wrap.appendChild(buildTranslateRow(msg, div));
+      // Alle kundebeskeder kan oversættes manuelt fra dashboard.
+      if (msg.role === 'customer') {
+        wrap.appendChild(buildTranslateRow(msg, div));
       }
     }
 
@@ -613,11 +613,13 @@
 
     var toggleBtn = document.createElement('button');
     toggleBtn.className = 'translate-toggle-btn';
+    var hasOriginal = !!msg.original_text;
+    if (!hasOriginal) toggleBtn.style.display = 'none';
 
     function render() {
       var state = viewState[key] || 'da';
       if (state === 'da') {
-        badge.textContent = 'DA';
+        badge.textContent = msg.original_lang ? (LANG_NAMES[msg.original_lang] || msg.original_lang.toUpperCase()) : 'DA';
         toggleBtn.textContent = 'Vis original';
         textDiv.textContent = msg.text;
       } else if (state === 'original') {
@@ -633,6 +635,7 @@
     }
 
     toggleBtn.addEventListener('click', function() {
+      if (!hasOriginal) return;
       // Fra dansk -> vis original. Fra original ELLER et on-demand-sprog -> tilbage til dansk.
       viewState[key] = (viewState[key] || 'da') === 'da' ? 'original' : 'da';
       render();
