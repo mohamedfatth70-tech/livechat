@@ -285,7 +285,7 @@
 
     <!-- FEATURE 3: Oversæt-bjælke til agenten -->
     <div id="translate-bar">
-      🌐 Auto-oversæt kundens beskeder til:
+       Auto-oversæt kundens beskeder til:
       <select id="agent-translate-select">
         <option value="">— fra (originalsprog) —</option>
         <option value="en">Engelsk</option>
@@ -560,7 +560,7 @@
     var meta = 'Session: ' + id.slice(0, 8);
     if (s.email) meta += ' · ' + s.email;
     if (s.phone) meta += ' · ' + s.phone;
-    if (s.lang)  meta += ' · 🌐 ' + s.lang.toUpperCase();
+    if (s.lang)  meta += ' ' + s.lang.toUpperCase();
     if (isClosed) meta = '🔴 Lukket · ' + meta;
     chatMetaEl.textContent = meta;
 
