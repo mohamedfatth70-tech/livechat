@@ -207,6 +207,40 @@
     box-shadow: 0 4px 16px rgba(192,57,43,0.45);
   }
   #toast.show { opacity: 1; }
+
+  /* FEATURE 2: Læsestatus under kundens beskeder */
+  .msg-read-status {
+    font-size: 10.5px; color: var(--text-mute);
+    align-self: flex-start;
+    margin-top: -4px; margin-bottom: 2px;
+    display: flex; align-items: center; gap: 3px;
+  }
+  .msg-read-status.read { color: #6effa0; }
+  .msg-read-status svg { width: 12px; height: 12px; fill: currentColor; }
+
+  /* FEATURE 3: Oversæt-knap i agentens visning */
+  .msg-translate-btn {
+    align-self: flex-start;
+    background: none; border: 1px solid var(--border2);
+    color: var(--text-mute); border-radius: 5px;
+    font-size: 11px; cursor: pointer; padding: 2px 7px;
+    margin-top: -4px; margin-bottom: 2px;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .msg-translate-btn:hover { color: var(--text); border-color: var(--text-mute); }
+
+  /* FEATURE 3: Sprog-vælger i chat-header */
+  #translate-bar {
+    display: none; align-items: center; gap: 8px;
+    padding: 6px 20px; background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    font-size: 11.5px; color: var(--text-mute); flex-shrink: 0;
+  }
+  #translate-bar select {
+    background: var(--bg3); border: 1px solid var(--border2);
+    color: var(--text); border-radius: 5px; padding: 3px 8px;
+    font-size: 11.5px; cursor: pointer; outline: none;
+  }
 </style>
 </head>
 <body>
@@ -247,6 +281,23 @@
         <div id="chat-meta"></div>
       </div>
       <button id="close-session-btn" onclick="closeSession()">Afslut chat</button>
+    </div>
+
+    <!-- FEATURE 3: Oversæt-bjælke til agenten -->
+    <div id="translate-bar">
+      🌐 Auto-oversæt kundens beskeder til:
+      <select id="agent-translate-select">
+        <option value="">— fra (originalsprog) —</option>
+        <option value="en">Engelsk</option>
+        <option value="de">Tysk</option>
+        <option value="sv">Svensk</option>
+        <option value="nb">Norsk</option>
+        <option value="da">Dansk</option>
+        <option value="nl">Hollandsk</option>
+        <option value="fr">Fransk</option>
+        <option value="es">Spansk</option>
+        <option value="pl">Polsk</option>
+      </select>
     </div>
 
     <div id="no-chat">
@@ -292,6 +343,32 @@
   var statusDot    = document.getElementById('status-dot');
   var statusText   = document.getElementById('status-text');
   var toastEl      = document.getElementById('toast');
+  var translateBar = document.getElementById('translate-bar');        // FEATURE 3
+  var agentTranslateSelect = document.getElementById('agent-translate-select'); // FEATURE 3
+
+  // FEATURE 3: sprogvalg for agentens oversættelses-bjælke
+  var agentTargetLang = '';
+  agentTranslateSelect.addEventListener('change', function() {
+    agentTargetLang = this.value;
+    if (agentTargetLang && activeSessionId) {
+      // Oversæt alle eksisterende kundebeskeder
+      var customerDivs = messagesEl.querySelectorAll('.msg-customer[data-original]');
+      customerDivs.forEach(function(div) {
+        var original = div.getAttribute('data-original');
+        translateText(original, agentTargetLang, function(translated) {
+          div.textContent = translated;
+        });
+      });
+    }
+  });
+
+  function translateText(text, targetLang, callback) {
+    if (!text || !targetLang) { callback(text); return; }
+    fetch(API_BASE + '/translate?text=' + encodeURIComponent(text) + '&from=da&to=' + targetLang)
+      .then(function(r) { return r.json(); })
+      .then(function(d) { callback(d.translated || text); })
+      .catch(function() { callback(text); });
+  }
 
   requestNotifPermission();
   startPolling();
@@ -483,6 +560,7 @@
     var meta = 'Session: ' + id.slice(0, 8);
     if (s.email) meta += ' · ' + s.email;
     if (s.phone) meta += ' · ' + s.phone;
+    if (s.lang)  meta += ' · 🌐 ' + s.lang.toUpperCase();
     if (isClosed) meta = '🔴 Lukket · ' + meta;
     chatMetaEl.textContent = meta;
 
@@ -490,6 +568,7 @@
     noChatEl.style.display = 'none';
     inputBar.style.display = isClosed ? 'none' : 'flex';
     closeBtn.style.display = isClosed ? 'none' : 'block';
+    translateBar.style.display = 'flex'; // FEATURE 3: vis oversæt-bjælke
 
     rebuildMessages(id);
     agentInput.focus();
@@ -499,6 +578,15 @@
 
     // Fetch latest messages immediately
     fetchMessages(id);
+
+    // FEATURE 2: send læsekvittering til serveren
+    if (!isClosed) {
+      fetch(API_BASE + '/message/read', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
+        body: JSON.stringify({ sessionId: id })
+      }).catch(function() {}); // fejl er ikke kritisk
+    }
   }
 
   function rebuildMessages(sessionId) {
@@ -565,9 +653,40 @@
       var div = document.createElement('div');
       div.className = 'msg msg-' + msg.role;
       div.textContent = msg.text;
+      if (msg.role === 'customer') div.setAttribute('data-original', msg.text); // FEATURE 3
 
       wrap.appendChild(label);
       wrap.appendChild(div);
+
+      // FEATURE 2: vis læse-status under kundebeskeder
+      if (msg.role === 'customer') {
+        var readEl = document.createElement('div');
+        readEl.className = 'msg-read-status' + (msg.read_at ? ' read' : '');
+        if (msg.read_at) {
+          readEl.innerHTML = '<svg viewBox="0 0 24 24"><path d="M17.98 7l-1.42-1.42-6.58 6.58-2.58-2.58L6 11l4 4 8-8zM2.01 11l4 4 1.42-1.42L3.43 11 2.01 11zm19.98-4l-1.42-1.42L11 15.16l-1.58-1.58L8 15l3 3 10.99-11z"/></svg> Læst';
+        } else {
+          readEl.innerHTML = '<svg viewBox="0 0 24 24"><path d="M18 7l-1.4-1.4-6.6 6.6-2.6-2.6L6 11l4 4z"/></svg> Leveret';
+        }
+        wrap.appendChild(readEl);
+
+        // FEATURE 3: oversæt-knap under kundebeskeder
+        if (agentTargetLang) {
+          translateText(msg.text, agentTargetLang, function(translated) {
+            div.textContent = translated;
+          });
+        }
+        var tBtn = document.createElement('button');
+        tBtn.className = 'msg-translate-btn';
+        tBtn.textContent = '🌐 Oversæt til dansk';
+        tBtn.addEventListener('click', function() {
+          translateText(msg.text, 'da', function(translated) {
+            div.textContent = translated;
+            tBtn.textContent = '↩ Original';
+            tBtn.onclick = function() { div.textContent = msg.text; tBtn.textContent = '🌐 Oversæt til dansk'; tBtn.onclick = null; };
+          });
+        });
+        wrap.appendChild(tBtn);
+      }
     }
 
     messagesEl.appendChild(wrap);
