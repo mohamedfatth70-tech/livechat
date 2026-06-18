@@ -267,7 +267,8 @@
 
 <script>
 (function () {
-  var API_BASE = 'http://localhost:3001';
+  var API_BASE = 'https://livechat-ecru-seven.vercel.app';
+  var AGENT_SECRET = 'p2nh7wqt5xm3rvkd8bjyfe6lcs4aguoz';
   var sessions = {};          // id -> { id, name, email, phone, status, messages: [], unread: 0 }
   var activeSessionId = null;
   // Hent agentens navn fra auth (AutoLockAuth eller MSAL)
@@ -337,7 +338,7 @@
   }
 
   function fetchSessions() {
-    return fetch(API_BASE + '/sessions')
+    return fetch(API_BASE + '/sessions', { headers: { 'X-Agent-Secret': AGENT_SECRET } })
       .then(function(r) { return r.json(); })
       .then(function(data) {
         var list = data.sessions || [];
@@ -509,7 +510,7 @@
   }
 
   function fetchMessages(sessionId) {
-    return fetch(API_BASE + '/messages/' + sessionId)
+    return fetch(API_BASE + '/messages/' + sessionId, { headers: { 'X-Agent-Secret': AGENT_SECRET } })
       .then(function(r) { return r.json(); })
       .then(function(data) {
         var msgs = data.messages || [];
@@ -584,9 +585,9 @@
     agentInput.style.height = 'auto';
     sendBtn.disabled = true;
 
-    fetch(API_BASE + '/agent/reply', {
+    fetch(API_BASE + '/agent/reply', { // requires agent auth
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
       body: JSON.stringify({ sessionId: activeSessionId, message: text, agentName: AGENT_NAME })
     })
     .then(function(r) { return r.json(); })
