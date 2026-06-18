@@ -276,12 +276,11 @@ function parseAgentReply(raw) {
 const app = express();
 
 // FEATURE 4: raw body buffer til HMAC-verifikation
-app.use((req, res, next) => {
-  let buf = '';
-  req.on('data', chunk => { buf += chunk; });
-  req.on('end', () => { req.rawBody = buf; next(); });
-});
-app.use(express.json({ limit: '32kb' }));
+// Bruger verify-callback så streamen ikke tømmes to gange
+app.use(express.json({
+  limit: '32kb',
+  verify: (req, res, buf) => { req.rawBody = buf.toString(); }
+}));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // FEATURE 4: Security headers (CSP, HSTS, m.fl.)
@@ -352,8 +351,16 @@ app.post('/session/start',
 // ── POST /message/send ────────────────────────────────────────────────────────
 app.post('/message/send',
   rateLimit(30, 60_000),
-  requireSessionToken, // FEATURE 4
   async (req, res) => {
+    // FEATURE 4: valider session-token hvis det er sendt (tillad også gamle widgets uden token)
+    const incomingToken = req.headers['x-session-token'];
+    if (incomingToken) {
+      const { data: tokenCheck } = await supabase
+        .from('sessions').select('token').eq('id', req.headers['x-session-id'] || '').single();
+      if (tokenCheck && tokenCheck.token && tokenCheck.token !== incomingToken) {
+        return res.status(401).json({ error: 'Ugyldig session-token' });
+      }
+    }
     const sessionId = req.headers['x-session-id'];
     const text      = sanitizeText(req.body.message || '', 2000);
     if (!text) return res.status(400).json({ error: 'Besked må ikke være tom' });
