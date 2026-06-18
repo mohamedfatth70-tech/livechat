@@ -1,467 +1,846 @@
-'use strict';
-
-const express  = require('express');
-const https    = require('https');
-const crypto   = require('crypto');
-const { createClient } = require('@supabase/supabase-js');
-const path = require('path');
-
-// ─── Konfiguration ────────────────────────────────────────────────────────────
-
-const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WEBHOOK_SECRET', 'AGENT_SECRET'];
-for (const key of REQUIRED_ENV) {
-  if (!process.env[key]) {
-    console.error(`[boot] FEJL: Miljøvariabel '${key}' mangler. Sæt den i Vercel dashboard.`);
-    process.exit(1);
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LiveChat Widget — AutoLock</title>
+<style>
+  :root {
+    --lc-red:      #c0392b;
+    --lc-red-dark: #a93226;
+    --lc-red-soft: #e74c3c;
+    --lc-bg:       #1a1212;
+    --lc-bg2:      #221818;
+    --lc-bg3:      #2e1f1f;
+    --lc-border:   #3d2222;
+    --lc-border2:  #4a2828;
   }
-}
 
-const CONFIG = {
-  port:            process.env.PORT || 3001,
-  teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL || '',
-  webhookSecret:   process.env.WEBHOOK_SECRET,
-  agentSecret:     process.env.AGENT_SECRET,
-  replyTrigger:    '!svar',
-  allowedOrigins:  (process.env.ALLOWED_ORIGINS || 'http://localhost:3001')
-                     .split(',').map(s => s.trim()).filter(Boolean),
-};
-
-// ─── Supabase ─────────────────────────────────────────────────────────────────
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
-
-// ─── SSE: aktive lyttere pr. session ──────────────────────────────────────────
-// Map<sessionId, Set<res>>
-const sseClients = new Map();
-
-function sseSubscribe(sessionId, res) {
-  if (!sseClients.has(sessionId)) sseClients.set(sessionId, new Set());
-  sseClients.get(sessionId).add(res);
-}
-
-function sseUnsubscribe(sessionId, res) {
-  const set = sseClients.get(sessionId);
-  if (set) { set.delete(res); if (set.size === 0) sseClients.delete(sessionId); }
-}
-
-function sseBroadcast(sessionId, event, data) {
-  const set = sseClients.get(sessionId);
-  if (!set || set.size === 0) return;
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of set) {
-    try { res.write(payload); } catch (_) { sseUnsubscribe(sessionId, res); }
+  #lc-launcher {
+    position: fixed; bottom: 24px; right: 24px; z-index: 99998;
+    width: 58px; height: 58px; border-radius: 50%;
+    background: var(--lc-red); border: none; cursor: pointer;
+    box-shadow: 0 4px 24px rgba(192,57,43,0.5);
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.18s, transform 0.18s;
   }
-}
+  #lc-launcher:hover { background: var(--lc-red-dark); transform: scale(1.06); }
+  #lc-launcher svg { width: 26px; height: 26px; fill: #fff; }
+  #lc-launcher .lc-badge {
+    position: absolute; top: 2px; right: 2px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; border: 2px solid var(--lc-red); display: none;
+  }
 
-// ─── Rate limiting (in-memory, nulstilles ved server-genstart) ────────────────
-// På Vercel er dette per-instans – tilstrækkelig til at afbøde burst-angreb.
-// For produktions-grade rate limiting: brug Upstash Redis eller Vercel Edge Middleware.
+  #lc-window {
+    position: fixed; bottom: 94px; right: 24px; z-index: 99999;
+    width: 360px; max-height: 560px;
+    background: var(--lc-bg2); border-radius: 14px;
+    box-shadow: 0 12px 48px rgba(0,0,0,0.6), 0 0 0 1px var(--lc-border);
+    display: flex; flex-direction: column; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px; transition: opacity 0.2s, transform 0.2s;
+    transform-origin: bottom right;
+  }
+  #lc-window.lc-hidden { opacity: 0; pointer-events: none; transform: scale(0.92) translateY(8px); }
 
-const rateLimitStore = new Map(); // ip → { count, resetAt }
+  /* Header */
+  #lc-header {
+    background: linear-gradient(135deg, var(--lc-red-dark) 0%, var(--lc-red) 100%);
+    padding: 14px 16px 12px; display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  }
+  #lc-header .lc-logo {
+    width: 36px; height: 36px; border-radius: 8px;
+    background: rgba(255,255,255,0.18);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  #lc-header .lc-logo svg { width: 20px; height: 20px; fill: #fff; }
+  #lc-header .lc-info { flex: 1; min-width: 0; }
+  #lc-header .lc-name { font-weight: 700; font-size: 14px; color: #fff; line-height: 1.2; }
+  #lc-header .lc-status { font-size: 11px; color: rgba(255,255,255,0.75); display: flex; align-items: center; gap: 4px; margin-top: 2px; }
+  #lc-header .lc-dot { width: 7px; height: 7px; border-radius: 50%; background: #6effa0; display: inline-block; box-shadow: 0 0 6px #6effa0; }
+  #lc-header .lc-dot-offline { width: 7px; height: 7px; border-radius: 50%; background: #ffb347; display: inline-block; box-shadow: 0 0 6px #ffb347; }
+  .lc-header-btn {
+    background: rgba(255,255,255,0.15); border: none; cursor: pointer;
+    color: #fff; padding: 5px; display: flex; align-items: center;
+    border-radius: 6px; transition: background 0.15s;
+  }
+  .lc-header-btn:hover { background: rgba(255,255,255,0.28); }
+  .lc-header-btn svg { width: 16px; height: 16px; fill: currentColor; }
 
-function rateLimit(maxRequests, windowMs) {
-  return (req, res, next) => {
-    const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-    const now = Date.now();
-    let entry = rateLimitStore.get(ip);
-    if (!entry || now > entry.resetAt) {
-      entry = { count: 0, resetAt: now + windowMs };
-      rateLimitStore.set(ip, entry);
+  /* Intro */
+  #lc-intro {
+    padding: 20px 16px; flex: 1;
+    display: flex; flex-direction: column; gap: 12px;
+    overflow-y: auto; background: var(--lc-bg2);
+  }
+  #lc-intro p { margin: 0; color: #c9a8a8; line-height: 1.5; font-size: 13.5px; }
+  #lc-intro label { font-size: 11.5px; font-weight: 700; color: #a07070; text-transform: uppercase; letter-spacing: 0.06em; display: block; margin-bottom: 5px; }
+  #lc-intro input, #lc-offline-form input, #lc-offline-form textarea {
+    width: 100%; box-sizing: border-box; padding: 9px 12px;
+    border: 1px solid var(--lc-border2); border-radius: 7px;
+    font-size: 14px; outline: none;
+    background: var(--lc-bg3); color: #f0dede;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    font-family: inherit;
+  }
+  #lc-intro input:focus, #lc-offline-form input:focus, #lc-offline-form textarea:focus {
+    border-color: var(--lc-red-soft); box-shadow: 0 0 0 3px rgba(231,76,60,0.15);
+  }
+  #lc-intro input::placeholder, #lc-offline-form input::placeholder, #lc-offline-form textarea::placeholder { color: #6b4040; }
+
+  /* Previous sessions link on intro */
+  #lc-history-link {
+    display: none; text-align: center;
+    font-size: 12px; color: #a07070;
+    margin-top: 2px;
+  }
+  #lc-history-link button {
+    background: none; border: none; cursor: pointer;
+    color: var(--lc-red-soft); font-size: 12px; text-decoration: underline;
+    padding: 0;
+  }
+  #lc-history-link button:hover { color: #f0dede; }
+
+  #lc-start-btn {
+    width: 100%; padding: 11px;
+    background: linear-gradient(135deg, var(--lc-red) 0%, var(--lc-red-soft) 100%);
+    color: #fff; border: none; border-radius: 7px;
+    font-size: 14px; font-weight: 700; cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+    margin-top: 4px; letter-spacing: 0.03em;
+    box-shadow: 0 3px 12px rgba(192,57,43,0.4);
+  }
+  #lc-start-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+  #lc-start-btn:active { transform: translateY(0); }
+  #lc-start-btn:disabled { background: var(--lc-border2); color: #6b4040; cursor: not-allowed; box-shadow: none; transform: none; }
+
+  /* ── Offline form ── */
+  #lc-offline {
+    padding: 20px 16px; flex: 1;
+    display: none; flex-direction: column; gap: 12px;
+    overflow-y: auto; background: var(--lc-bg2);
+  }
+  .lc-offline-notice {
+    display: flex; align-items: flex-start; gap: 10px;
+    background: var(--lc-bg3); border: 1px solid var(--lc-border2);
+    border-radius: 9px; padding: 12px 13px;
+  }
+  .lc-offline-notice svg { width: 18px; height: 18px; fill: #ffb347; flex-shrink: 0; margin-top: 1px; }
+  .lc-offline-notice p { margin: 0; color: #c9a8a8; font-size: 13px; line-height: 1.55; }
+  .lc-offline-notice strong { color: #f0dede; display: block; margin-bottom: 3px; font-size: 13.5px; }
+  #lc-offline-form { display: flex; flex-direction: column; gap: 12px; }
+  #lc-offline-form label { font-size: 11.5px; font-weight: 700; color: #a07070; text-transform: uppercase; letter-spacing: 0.06em; display: block; margin-bottom: 5px; }
+  #lc-offline-form textarea { resize: none; min-height: 80px; line-height: 1.5; }
+  #lc-offline-send-btn {
+    width: 100%; padding: 11px;
+    background: linear-gradient(135deg, var(--lc-red) 0%, var(--lc-red-soft) 100%);
+    color: #fff; border: none; border-radius: 7px;
+    font-size: 14px; font-weight: 700; cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+    margin-top: 4px; letter-spacing: 0.03em;
+    box-shadow: 0 3px 12px rgba(192,57,43,0.4);
+  }
+  #lc-offline-send-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+  #lc-offline-send-btn:disabled { background: var(--lc-border2); color: #6b4040; cursor: not-allowed; box-shadow: none; transform: none; }
+
+  /* Offline confirmation */
+  #lc-offline-thanks {
+    display: none; flex: 1; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px; padding: 32px 20px; text-align: center;
+    background: var(--lc-bg2);
+  }
+  #lc-offline-thanks svg { width: 44px; height: 44px; fill: #6effa0; }
+  #lc-offline-thanks strong { font-size: 15px; color: #f0dede; display: block; }
+  #lc-offline-thanks p { margin: 0; color: #c9a8a8; font-size: 13.5px; line-height: 1.6; }
+
+  /* Chat */
+  #lc-chat { display: none; flex: 1; flex-direction: column; min-height: 0; }
+  #lc-messages {
+    flex: 1; overflow-y: auto; padding: 14px 14px 8px;
+    display: flex; flex-direction: column; gap: 8px;
+    min-height: 0; background:#ffffff;
+  }
+  #lc-messages::-webkit-scrollbar { width: 4px; }
+  #lc-messages::-webkit-scrollbar-track { background: transparent; }
+  #lc-messages::-webkit-scrollbar-thumb { background: var(--lc-border2); border-radius: 2px; }
+
+  .lc-msg {
+    max-width: 82%; padding: 9px 13px; border-radius: 14px;
+    line-height: 1.5; word-break: break-word; font-size: 13.5px;
+  }
+  .lc-msg-customer {
+    align-self: flex-end;
+    background: linear-gradient(135deg, var(--lc-red) 0%, var(--lc-red-soft) 100%);
+    color: #fff; font-weight: 500; border-bottom-right-radius: 3px;
+    box-shadow: 0 2px 8px rgba(192,57,43,0.35);
+  }
+  .lc-msg-agent {
+    align-self: flex-start; background: var(--lc-bg3); color: #f0dede;
+    border: 1px solid var(--lc-border2); border-bottom-left-radius: 3px;
+  }
+  .lc-msg-system {
+    align-self: center; font-size: 11.5px; color: #6b4040; background: none; padding: 2px 0;
+  }
+
+  #lc-input-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; border-top: 1px solid var(--lc-border);
+    background: var(--lc-bg2); flex-shrink: 0;
+  }
+  #lc-msg-input {
+    flex: 1; padding: 8px 12px; border: 1px solid var(--lc-border2); border-radius: 20px;
+    font-size: 13.5px; outline: none; background: var(--lc-bg3); color: #f0dede;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    resize: none; line-height: 1.4; max-height: 80px; overflow-y: auto; font-family: inherit;
+  }
+  #lc-msg-input:focus { border-color: var(--lc-red-soft); box-shadow: 0 0 0 3px rgba(231,76,60,0.12); }
+  #lc-msg-input::placeholder { color: #6b4040; }
+  #lc-send-btn {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--lc-red) 0%, var(--lc-red-soft) 100%);
+    border: none; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; transition: opacity 0.15s, transform 0.1s;
+    box-shadow: 0 2px 8px rgba(192,57,43,0.4);
+  }
+  #lc-send-btn:hover { opacity: 0.88; transform: scale(1.05); }
+  #lc-send-btn:disabled { background: var(--lc-border2); box-shadow: none; cursor: not-allowed; }
+  #lc-send-btn svg { width: 15px; height: 15px; fill: #fff; }
+
+  #lc-end-bar { text-align: center; padding: 6px 12px 10px; background: var(--lc-bg2); flex-shrink: 0; }
+  #lc-end-btn {
+    background: none; border: none; font-size: 11.5px; color: #6b4040;
+    cursor: pointer; text-decoration: underline; transition: color 0.15s;
+  }
+  #lc-end-btn:hover { color: #c9a8a8; }
+
+  /* Closed */
+  #lc-closed {
+    display: none; padding: 32px 20px; text-align: center; flex: 1;
+    flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    background: var(--lc-bg2);
+  }
+  #lc-closed svg { width: 40px; height: 40px; fill: var(--lc-border2); margin-bottom: 4px; }
+  #lc-closed p { margin: 0; line-height: 1.6; color: #a07070; }
+  #lc-closed strong { display: block; font-size: 15px; color: #f0dede; margin-bottom: 6px; }
+  .lc-closed-btns { display: flex; flex-direction: column; gap: 8px; width: 100%; margin-top: 8px; }
+  #lc-new-chat-btn {
+    padding: 10px 22px;
+    background: linear-gradient(135deg, var(--lc-red) 0%, var(--lc-red-soft) 100%);
+    color: #fff; border: none; border-radius: 7px;
+    font-size: 13.5px; font-weight: 700; cursor: pointer;
+    letter-spacing: 0.03em; box-shadow: 0 3px 12px rgba(192,57,43,0.4);
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  #lc-new-chat-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+  #lc-view-history-btn {
+    padding: 9px 22px;
+    background: transparent;
+    color: #a07070; border: 1px solid var(--lc-border2); border-radius: 7px;
+    font-size: 13px; cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  #lc-view-history-btn:hover { color: #f0dede; border-color: #6b4040; }
+
+  /* History list screen */
+  #lc-history {
+    display: none; flex: 1; flex-direction: column; min-height: 0; background: var(--lc-bg2);
+  }
+  #lc-history-list {
+    flex: 1; overflow-y: auto; padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #lc-history-list::-webkit-scrollbar { width: 4px; }
+  #lc-history-list::-webkit-scrollbar-thumb { background: var(--lc-border2); border-radius: 2px; }
+  .lc-session-item {
+    background: var(--lc-bg3); border: 1px solid var(--lc-border2);
+    border-radius: 10px; padding: 12px 14px; cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .lc-session-item:hover { border-color: var(--lc-red-soft); background: #331f1f; }
+  .lc-session-item .lc-si-date { font-size: 11px; color: #6b4040; margin-bottom: 4px; }
+  .lc-session-item .lc-si-preview { font-size: 13px; color: #c9a8a8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .lc-session-item .lc-si-count { font-size: 11px; color: #6b4040; margin-top: 4px; }
+  #lc-history-empty { padding: 40px 20px; text-align: center; color: #6b4040; font-size: 13px; }
+  #lc-history-back-bar {
+    padding: 8px 12px 12px; border-top: 1px solid var(--lc-border);
+    background: var(--lc-bg2); flex-shrink: 0; text-align: center;
+  }
+  #lc-history-back-btn {
+    background: none; border: none; font-size: 12px; color: #6b4040;
+    cursor: pointer; text-decoration: underline; transition: color 0.15s;
+  }
+  #lc-history-back-btn:hover { color: #c9a8a8; }
+
+  /* Session detail (read-only) */
+  #lc-session-detail {
+    display: none; flex: 1; flex-direction: column; min-height: 0; background: var(--lc-bg2);
+  }
+  #lc-session-detail-msgs {
+    flex: 1; overflow-y: auto; padding: 14px 14px 8px;
+    display: flex; flex-direction: column; gap: 8px;
+    min-height: 0; background: var(--lc-bg);
+  }
+  #lc-session-detail-msgs::-webkit-scrollbar { width: 4px; }
+  #lc-session-detail-msgs::-webkit-scrollbar-thumb { background: var(--lc-border2); border-radius: 2px; }
+  #lc-detail-back-bar {
+    padding: 8px 12px 12px; border-top: 1px solid var(--lc-border);
+    background: var(--lc-bg2); flex-shrink: 0; text-align: center;
+  }
+  #lc-detail-back-btn {
+    background: none; border: none; font-size: 12px; color: #6b4040;
+    cursor: pointer; text-decoration: underline; transition: color 0.15s;
+  }
+  #lc-detail-back-btn:hover { color: #c9a8a8; }
+  .lc-readonly-badge {
+    align-self: center; margin: 4px 0 8px;
+    font-size: 11px; color: #6b4040;
+    background: var(--lc-bg3); border: 1px solid var(--lc-border2);
+    border-radius: 20px; padding: 3px 10px;
+  }
+
+  #lc-error {
+    display: none; margin: 8px 12px 0; padding: 8px 12px;
+    background: #2d0f0f; border: 1px solid var(--lc-red-dark);
+    border-radius: 6px; font-size: 12px; color: #ff9a9a; flex-shrink: 0;
+  }
+
+  @media (max-width: 400px) {
+    #lc-window { width: calc(100vw - 24px); right: 12px; bottom: 82px; }
+    #lc-launcher { right: 12px; bottom: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<button id="lc-launcher" aria-label="Öppna live chat">
+  <svg viewBox="0 0 24 24"><path d="M20 2H4C2.9 2 2 2.9 2 4v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 12H6l-2 2V4h16v10z"/></svg>
+  <span class="lc-badge" id="lc-badge"></span>
+</button>
+
+<div id="lc-window" class="lc-hidden" role="dialog" aria-label="Live chat">
+
+  <div id="lc-header">
+    <div class="lc-logo" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+    </div>
+    <div class="lc-info">
+      <div class="lc-name" id="lc-header-title">AutoLock Support</div>
+      <div class="lc-status" id="lc-status-line">
+        <span class="lc-dot" id="lc-status-dot"></span>
+        <span id="lc-status-text">Online nu</span>
+      </div>
+    </div>
+    <button class="lc-header-btn" id="lc-close-btn" aria-label="Stäng chat">
+      <svg viewBox="0 0 24 24"><path d="M19 6.4L17.6 5 12 10.6 6.4 5 5 6.4l5.6 5.6L5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6z"/></svg>
+    </button>
+  </div>
+
+  <div id="lc-error"></div>
+
+  <!-- Intro / start form (online hours) -->
+  <div id="lc-intro">
+    <div id="lc-closed-notice" style="display:none;background:#1a0a0a;border:1px solid #3a1f1f;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:13px;color:#c9a8a8;line-height:1.55;">
+      <span style="color:#ffb347;font-weight:700;display:block;margin-bottom:3px;">⏰ ⏰ Vi är för tillfället stängda</span>
+      Ditt meddelande är mottaget och vi återkommer under våra öppettider (mån–fre 08–16).
+    </div>
+    <p>Har du frågor om stöldskydd eller utrustning till din skåpbil? Vi finns här!</p>
+    <div>
+      <label for="lc-name-input">Namn</label>
+      <input type="text" id="lc-name-input" placeholder="Ditt namn" autocomplete="given-name">
+    </div>
+    <div>
+      <label for="lc-email-input">E-post</label>
+      <input type="email" id="lc-email-input" placeholder="din@email.se" autocomplete="email">
+    </div>
+    <div>
+      <label for="lc-phone-input">Telefon <span style="font-weight:400;color:#555;text-transform:none">((valfritt))</span></label>
+      <input type="tel" id="lc-phone-input" placeholder="+46 12 345 67 89" autocomplete="tel">
+    </div>
+    <button id="lc-start-btn">Starta chat</button>
+    <div id="lc-history-link">
+      <button id="lc-show-history-btn">Se tidigare samtal</button>
+    </div>
+  </div>
+
+  <!-- Offline / eftermiddag: efterlad besked -->
+  <div id="lc-offline">
+    <div class="lc-offline-notice">
+      <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+      <p>
+        <strong>Vi är stängda för idag</strong>
+        Skriv dina uppgifter så återkommer vi när kontoret öppnar igen.
+      </p>
+    </div>
+    <div id="lc-offline-form">
+      <div>
+        <label for="lc-off-name">Namn</label>
+        <input type="text" id="lc-off-name" placeholder="Ditt namn" autocomplete="given-name">
+      </div>
+      <div>
+        <label for="lc-off-email">E-post</label>
+        <input type="email" id="lc-off-email" placeholder="din@email.se" autocomplete="email">
+      </div>
+      <div>
+        <label for="lc-off-phone">Telefon <span style="font-weight:400;color:#555;text-transform:none">((valfritt))</span></label>
+        <input type="tel" id="lc-off-phone" placeholder="+46 12 345 67 89" autocomplete="tel">
+      </div>
+      <div>
+        <label for="lc-off-msg">Meddelande</label>
+        <textarea id="lc-off-msg" placeholder="Beskriv vad du behöver hjälp med…" rows="3"></textarea>
+      </div>
+      <button id="lc-offline-send-btn">Skicka meddelande</button>
+    </div>
+  </div>
+
+  <!-- Offline tak-skærm -->
+  <div id="lc-offline-thanks">
+    <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z"/></svg>
+    <strong>Meddelande mottaget!</strong>
+    <p>Tack — vi återkommer till dig så snart som möjligt när kontoret öppnar igen.</p>
+  </div>
+
+  <!-- Active chat -->
+  <div id="lc-chat">
+    <div id="lc-messages" role="log" aria-live="polite"></div>
+    <div id="lc-input-bar">
+      <textarea id="lc-msg-input" rows="1" placeholder="Skriv ditt meddelande…" aria-label="Skriv besked"></textarea>
+      <button id="lc-send-btn" aria-label="Skicka">
+        <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      </button>
+    </div>
+    <div id="lc-end-bar">
+      <button id="lc-end-btn">Avsluta chat</button>
+    </div>
+  </div>
+
+  <!-- Chat ended -->
+  <div id="lc-closed">
+    <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z"/></svg>
+    <p><strong>Chat avslutad</strong>Tack för din förfrågan till AutoLock. Vi återkommer så snart som möjligt.</p>
+    <div class="lc-closed-btns">
+      <button id="lc-new-chat-btn">Starta ny chat</button>
+      <button id="lc-view-history-btn">Se tidigare samtal</button>
+    </div>
+  </div>
+
+  <!-- History list -->
+  <div id="lc-history">
+    <div id="lc-history-list"></div>
+    <div id="lc-history-back-bar">
+      <button id="lc-history-back-btn">← Tillbaka</button>
+    </div>
+  </div>
+
+  <!-- Session detail (read-only) -->
+  <div id="lc-session-detail">
+    <div id="lc-session-detail-msgs"></div>
+    <div id="lc-detail-back-bar">
+      <button id="lc-detail-back-btn">← Tillbaka till samtal</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  var API_BASE = 'https://livechat-ecru-seven.vercel.app'; // Relativ URL – virker både lokalt og på Vercel
+  var LS_KEY   = 'autolock_chat_sessions_se';
+
+  // ── Office hours: 08:00–16:00 (Danish local time) ─────────────────────────
+  var OFFICE_OPEN_HOUR  = 8;
+  var OFFICE_CLOSE_HOUR = 16;
+
+  function isOfficeOpen() {
+    var now = new Date();
+    var hour = parseInt(now.toLocaleString('da-DK', { timeZone: 'Europe/Copenhagen', hour: 'numeric', hour12: false }), 10);
+    return hour >= OFFICE_OPEN_HOUR && hour < OFFICE_CLOSE_HOUR;
+  }
+
+  var sessionId   = null;
+  var lastMsgId   = 0;
+  var pollTimer   = null;
+  var isOpen      = false;
+  var currentMsgs = [];
+
+  var historyBackTarget = 'intro';
+
+  var launcher        = document.getElementById('lc-launcher');
+  var badge           = document.getElementById('lc-badge');
+  var win             = document.getElementById('lc-window');
+  var closeBtn        = document.getElementById('lc-close-btn');
+  var headerTitle     = document.getElementById('lc-header-title');
+  var statusDot       = document.getElementById('lc-status-dot');
+  var statusText      = document.getElementById('lc-status-text');
+  var introEl         = document.getElementById('lc-intro');
+  var offlineEl       = document.getElementById('lc-offline');
+  var offlineThanksEl = document.getElementById('lc-offline-thanks');
+  var chatEl          = document.getElementById('lc-chat');
+  var closedEl        = document.getElementById('lc-closed');
+  var historyEl       = document.getElementById('lc-history');
+  var historyList     = document.getElementById('lc-history-list');
+  var sessionDetailEl = document.getElementById('lc-session-detail');
+  var detailMsgsEl    = document.getElementById('lc-session-detail-msgs');
+  var errorEl         = document.getElementById('lc-error');
+  var nameInput       = document.getElementById('lc-name-input');
+  var emailInput      = document.getElementById('lc-email-input');
+  var phoneInput      = document.getElementById('lc-phone-input');
+  var startBtn        = document.getElementById('lc-start-btn');
+  var historyLink     = document.getElementById('lc-history-link');
+  var showHistoryBtn  = document.getElementById('lc-show-history-btn');
+  var messagesEl      = document.getElementById('lc-messages');
+  var msgInput        = document.getElementById('lc-msg-input');
+  var sendBtn         = document.getElementById('lc-send-btn');
+  var endBtn          = document.getElementById('lc-end-btn');
+  var newChatBtn      = document.getElementById('lc-new-chat-btn');
+  var viewHistoryBtn  = document.getElementById('lc-view-history-btn');
+  var historyBackBtn  = document.getElementById('lc-history-back-btn');
+  var detailBackBtn   = document.getElementById('lc-detail-back-btn');
+
+  var offSendBtn  = document.getElementById('lc-offline-send-btn');
+  var offName     = document.getElementById('lc-off-name');
+  var offEmail    = document.getElementById('lc-off-email');
+  var offPhone    = document.getElementById('lc-off-phone');
+  var offMsg      = document.getElementById('lc-off-msg');
+
+  var CHAT_SVG  = '<svg viewBox="0 0 24 24" fill="#fff"><path d="M20 2H4C2.9 2 2 2.9 2 4v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 12H6l-2 2V4h16v10z"/></svg>';
+  var CLOSE_SVG = '<svg viewBox="0 0 24 24" fill="#fff"><path d="M19 6.4L17.6 5 12 10.6 6.4 5 5 6.4l5.6 5.6L5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6z"/></svg>';
+
+  function updateStatusIndicator() {
+    if (isOfficeOpen()) {
+      statusDot.className = 'lc-dot';
+      statusText.textContent = 'Online nu';
+    } else {
+      statusDot.className = 'lc-dot-offline';
+      statusText.textContent = 'Åbner igen kl. 08:00';
     }
-    entry.count++;
-    if (entry.count > maxRequests) {
-      return res.status(429).json({ error: 'For mange forespørgsler – prøv igen om lidt' });
-    }
-    next();
-  };
-}
-
-// ─── Auth-middleware til agent-endpoints ──────────────────────────────────────
-
-function requireAgentAuth(req, res, next) {
-  const token = req.headers['x-agent-secret'] || req.query.agent_secret;
-  if (!token || token !== CONFIG.agentSecret) {
-    return res.status(401).json({ error: 'Uautoriseret' });
   }
-  next();
-}
 
-// ─── Hjælpefunktioner ─────────────────────────────────────────────────────────
+  function loadSessions() {
+    try { return JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch(e) { return []; }
+  }
 
-function makeId()      { return crypto.randomBytes(16).toString('hex'); }
-function makeShort(id) { return id.slice(0, 8); }
+  function saveSessions(sessions) {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(sessions)); } catch(e) {}
+  }
 
-const VALID_LANGS = ['da', 'sv', 'de', 'en', 'nb', 'fi', 'nl', 'fr', 'es', 'pl'];
-function sanitizeLang(lang) {
-  const l = (lang || 'da').toLowerCase().slice(0, 5);
-  return VALID_LANGS.includes(l) ? l : 'da';
-}
+  function saveSession(id, name, messages) {
+    var sessions = loadSessions();
+    sessions = sessions.filter(function(s) { return s.id !== id; });
+    sessions.unshift({ id: id, name: name, date: new Date().toISOString(), messages: messages });
+    if (sessions.length > 20) sessions = sessions.slice(0, 20);
+    saveSessions(sessions);
+  }
 
-function sanitizeText(str, maxLen = 2000) {
-  if (typeof str !== 'string') return '';
-  return str.trim().slice(0, maxLen);
-}
+  function formatDate(iso) {
+    var d = new Date(iso);
+    var now = new Date();
+    var diff = now - d;
+    if (diff < 60000) return 'Lige nu';
+    if (diff < 3600000) return Math.floor(diff/60000) + ' min siden';
+    if (diff < 86400000) return 'I dag ' + d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+    return d.getDate() + '/' + (d.getMonth()+1) + '/' + d.getFullYear();
+  }
 
-// ─── Oversættelse via MyMemory ────────────────────────────────────────────────
+  function showOnly(el) {
+    [introEl, offlineEl, offlineThanksEl, chatEl, closedEl, historyEl, sessionDetailEl].forEach(function(e) {
+      e.style.display = 'none';
+    });
+    el.style.display = 'flex';
+  }
 
-function httpGet(url) {
-  return new Promise((resolve) => {
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve(data));
-    }).on('error', () => resolve(null));
+  function toggleChat() {
+    isOpen = !isOpen;
+    win.classList.toggle('lc-hidden', !isOpen);
+    badge.style.display = 'none';
+    launcher.innerHTML = (isOpen ? CLOSE_SVG : CHAT_SVG) + '<span class="lc-badge" id="lc-badge" style="display:none"></span>';
+    badge = document.getElementById('lc-badge');
+
+    if (isOpen && !sessionId) {
+      updateStatusIndicator();
+      refreshHistoryLink();
+      showOnly(introEl);
+      var closedNotice = document.getElementById('lc-closed-notice');
+      if (closedNotice) closedNotice.style.display = isOfficeOpen() ? 'none' : 'block';
+      nameInput.focus();
+    }
+    if (isOpen && sessionId) msgInput.focus();
+  }
+
+  launcher.addEventListener('click', toggleChat);
+  closeBtn.addEventListener('click', function() { isOpen = true; toggleChat(); });
+
+  function showError(msg) {
+    errorEl.textContent = msg;
+    errorEl.style.display = 'block';
+    setTimeout(function() { errorEl.style.display = 'none'; }, 5000);
+  }
+
+  function refreshHistoryLink() {
+    var sessions = loadSessions();
+    historyLink.style.display = sessions.length > 0 ? 'block' : 'none';
+  }
+
+  showHistoryBtn.addEventListener('click', function() {
+    historyBackTarget = 'intro';
+    openHistory();
   });
-}
 
-async function detectAndTranslateToDanish(text) {
-  if (!text?.trim()) return { translated: text, detectedLang: 'da' };
-  try {
-    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=autodetect|da`);
-    const json = JSON.parse(raw);
-    const detected = (json.matches?.[0]?.source || json.responseData?.match?.source || 'da').toLowerCase();
-    if (detected === 'da') {
-      return { translated: text, detectedLang: 'da' };
-    }
-    return {
-      translated:   json.responseData?.translatedText || text,
-      detectedLang: detected,
-    };
-  } catch { return { translated: text, detectedLang: 'da' }; }
-}
-
-async function translateToCustomerLang(text, targetLang) {
-  if (!text?.trim() || !targetLang || targetLang === 'da') return text;
-  try {
-    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${targetLang}`);
-    const json = JSON.parse(raw);
-    return json.responseData?.translatedText || text;
-  } catch { return text; }
-}
-
-// ─── Teams webhook ────────────────────────────────────────────────────────────
-
-function postToTeams(payload) {
-  if (!CONFIG.teamsWebhookUrl) return Promise.resolve(false);
-  return new Promise((resolve) => {
-    const body = JSON.stringify(payload);
-    const url  = new URL(CONFIG.teamsWebhookUrl);
-    const req  = https.request({
-      hostname: url.hostname, port: url.port || 443,
-      path: url.pathname + url.search, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, res => { res.resume(); resolve(res.statusCode >= 200 && res.statusCode < 300); });
-    req.on('error', () => resolve(false));
-    req.setTimeout(10000, () => { req.destroy(); resolve(false); });
-    req.write(body); req.end();
+  viewHistoryBtn.addEventListener('click', function() {
+    historyBackTarget = 'closed';
+    openHistory();
   });
-}
 
-function adaptiveCard(bodyBlocks) {
-  return {
-    type: 'message',
-    attachments: [{
-      contentType: 'application/vnd.microsoft.card.adaptive',
-      content: {
-        $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
-        type: 'AdaptiveCard', version: '1.4',
-        body: bodyBlocks,
-      },
-    }],
-  };
-}
+  offSendBtn.addEventListener('click', submitOfflineForm);
 
-function sendToTeams(sessionId, customerName, message) {
-  const short = makeShort(sessionId);
-  return postToTeams(adaptiveCard([
-    { type: 'TextBlock', text: `💬 Ny besked fra kunde`, size: 'Medium', weight: 'Bolder', color: 'Accent' },
-    { type: 'FactSet', facts: [
-      { title: 'Kunde',   value: customerName },
-      { title: 'Session', value: short },
-      { title: 'Besked',  value: message },
-    ]},
-    { type: 'TextBlock', text: `**Svar:** \`${CONFIG.replyTrigger} ${short}: Dit svar\``, wrap: true, color: 'Good', spacing: 'Medium' },
-  ]));
-}
+  function submitOfflineForm() {
+    var name  = offName.value.trim();
+    var email = offEmail.value.trim();
+    var msg   = offMsg.value.trim();
 
-function sendReminderToTeams(session) {
-  const short = makeShort(session.id);
-  return postToTeams(adaptiveCard([
-    { type: 'TextBlock', text: `⏰ Ubesvaret chat – ingen svar i over 1 minut`, size: 'Medium', weight: 'Bolder', color: 'Warning' },
-    { type: 'FactSet', facts: [
-      { title: 'Kunde',   value: session.name },
-      { title: 'Email',   value: session.email || '—' },
-      { title: 'Telefon', value: session.phone || '—' },
-      { title: 'Session', value: short },
-    ]},
-    { type: 'TextBlock', text: `**Svar:** \`${CONFIG.replyTrigger} ${short}: Dit svar\``, wrap: true, color: 'Good', spacing: 'Medium' },
-  ]));
-}
+    if (!name)  { showError('Vänligen ange ditt namn.'); offName.focus(); return; }
+    if (!email) { showError('Vänligen ange din e-postadress.'); offEmail.focus(); return; }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { showError('Ange en giltig e-postadress.'); offEmail.focus(); return; }
+    if (!msg)   { showError('Vänligen skriv ett meddelande.'); offMsg.focus(); return; }
 
-// ─── Reminder-timers (in-memory er OK – de er ikke kritiske) ─────────────────
+    offSendBtn.disabled = true;
+    offSendBtn.textContent = 'Skickar…';
 
-const pendingReminders = new Map();
-
-function scheduleReminder(session) {
-  clearReminder(session.id);
-  const t = setTimeout(async () => {
-    pendingReminders.delete(session.id);
-    const { data } = await supabase.from('sessions').select('status').eq('id', session.id).single();
-    if (data?.status === 'open') await sendReminderToTeams(session);
-  }, 60_000);
-  pendingReminders.set(session.id, t);
-}
-
-function clearReminder(sessionId) {
-  const t = pendingReminders.get(sessionId);
-  if (t) { clearTimeout(t); pendingReminders.delete(sessionId); }
-}
-
-// ─── Parse agent-svar fra Teams ───────────────────────────────────────────────
-
-function parseAgentReply(raw) {
-  raw = raw.trim().replace(/<[^>]+>/g, '').replace(/&[a-z]+;/gi, ' ').trim();
-  if (!raw.toLowerCase().startsWith(CONFIG.replyTrigger.toLowerCase())) return null;
-  const rest     = raw.slice(CONFIG.replyTrigger.length).trim();
-  const colonIdx = rest.indexOf(':');
-  if (colonIdx === -1) return null;
-  const shortId = rest.slice(0, colonIdx).trim();
-  const message = rest.slice(colonIdx + 1).trim();
-  if (!shortId || !message) return null;
-  return { shortId, message };
-}
-
-// ─── Express app ──────────────────────────────────────────────────────────────
-
-const app = express();
-app.use(express.json({ limit: '32kb' }));
-app.use(express.static(path.join(__dirname, 'public')));
-
-// CORS – kun kendte origins
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && CONFIG.allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-  }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-Webhook-Secret, X-Agent-Secret');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-
-// ── POST /session/start ───────────────────────────────────────────────────────
-app.post('/session/start',
-  rateLimit(10, 60_000), // maks 10 nye sessioner/minut per IP
-  async (req, res) => {
-    const name  = sanitizeText(req.body.name  || 'Gæst', 100);
-    const email = sanitizeText(req.body.email || '', 200) || null;
-    const phone = sanitizeText(req.body.phone || '', 30)  || null;
-    const lang  = sanitizeLang(req.body.lang);
-    const id    = makeId();
-
-    const { error } = await supabase.from('sessions').insert({ id, name, email, phone, lang, status: 'open' });
-    if (error) { console.error('[session/start]', error); return res.status(500).json({ error: 'Kunne ikke oprette session' }); }
-
-    await postToTeams(adaptiveCard([
-      { type: 'TextBlock', text: `🟢 Ny chat-session åbnet`, size: 'Medium', weight: 'Bolder', color: 'Good' },
-      { type: 'FactSet', facts: [
-        { title: 'Kunde',   value: name },
-        { title: 'Email',   value: email || '—' },
-        { title: 'Telefon', value: phone || '—' },
-        { title: 'Sprog',   value: lang.toUpperCase() },
-        { title: 'Session', value: makeShort(id) },
-      ]},
-    ]));
-
-    res.json({ session: { id, name, email, phone, lang, status: 'open' } });
-  }
-);
-
-// ── POST /message/send ────────────────────────────────────────────────────────
-app.post('/message/send',
-  rateLimit(30, 60_000), // maks 30 beskeder/minut per IP
-  async (req, res) => {
-    const sessionId = req.headers['x-session-id'];
-    const text      = sanitizeText(req.body.message || '', 2000);
-
-    if (!sessionId) return res.status(400).json({ error: 'X-Session-Id header mangler' });
-    if (!text)      return res.status(400).json({ error: 'Besked må ikke være tom' });
-
-    const { data: session, error: sessErr } = await supabase
-      .from('sessions').select('*').eq('id', sessionId).single();
-    if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
-    if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
-
-    // Gem både original og oversatt tekst (for customer messages er de ens)
-    const { data: msg, error: msgErr } = await supabase
-      .from('messages').insert({ 
-        session_id: sessionId, 
-        role: 'customer', 
-        text: text, 
-        text_original: text 
+    fetch(API_BASE + '/offline/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: name,
+        email: email,
+        phone: offPhone.value.trim() || undefined,
+        message: msg
       })
-      .select().single();
-    if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
-
-    scheduleReminder(session);
-    await sendToTeams(sessionId, session.name, text);
-
-    res.json({ message: msg });
-  }
-);
-
-// ── GET /message/sse – Server-Sent Events (erstatter long-poll) ───────────────
-// Widget lytter her efter agent-svar i realtid.
-app.get('/message/sse', (req, res) => {
-  const sessionId = req.headers['x-session-id'] || req.query.session_id;
-  if (!sessionId) return res.status(400).json({ error: 'session_id mangler' });
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  // Heartbeat hvert 25s for at holde forbindelsen i live
-  const hb = setInterval(() => { try { res.write(': heartbeat\n\n'); } catch (_) {} }, 25_000);
-
-  sseSubscribe(sessionId, res);
-  req.on('close', () => { clearInterval(hb); sseUnsubscribe(sessionId, res); });
-});
-
-// ── POST /webhook/teams ───────────────────────────────────────────────────────
-app.post('/webhook/teams', async (req, res) => {
-  const secret = req.headers['x-webhook-secret'] || '';
-  if (secret !== CONFIG.webhookSecret) return res.status(401).json({ error: 'Uautoriseret' });
-
-  const raw    = sanitizeText(req.body.text || '', 2000);
-  const parsed = parseAgentReply(raw);
-  if (!parsed) return res.json({ ignored: true, reason: 'Ikke et !svar-kommando' });
-
-  const { data: sessions } = await supabase
-    .from('sessions').select('*').eq('status', 'open').ilike('id', `${parsed.shortId}%`).limit(1);
-  const session = sessions?.[0];
-  if (!session) return res.json({ ignored: true, reason: 'Session ikke fundet' });
-
-  const rawMessage      = parsed.message;
-  const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
-
-  const { data: msg, error } = await supabase
-    .from('messages')
-    .insert({ 
-      session_id: session.id, 
-      role: 'agent', 
-      text: textForCustomer,
-      text_original: rawMessage 
     })
-    .select().single();
-  if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
-
-  clearReminder(session.id);
-  sseBroadcast(session.id, 'message', { ...msg, text: textForCustomer, originalText: rawMessage });
-  res.json({ saved: true, message: msg });
-});
-
-// ── POST /session/close ───────────────────────────────────────────────────────
-app.post('/session/close', async (req, res) => {
-  const sessionId = req.headers['x-session-id'];
-  if (!sessionId) return res.status(400).json({ error: 'X-Session-Id header mangler' });
-
-  const { data: session } = await supabase.from('sessions').select('name').eq('id', sessionId).single();
-  await supabase.from('sessions').update({ status: 'closed' }).eq('id', sessionId);
-  clearReminder(sessionId);
-
-  if (session) {
-    await postToTeams(adaptiveCard([
-      { type: 'TextBlock', text: `🔴 Chat lukket`, size: 'Medium', weight: 'Bolder', color: 'Attention' },
-      { type: 'FactSet', facts: [
-        { title: 'Kunde',   value: session.name },
-        { title: 'Session', value: makeShort(sessionId) },
-      ]},
-    ]));
+    .then(function() { showOnly(offlineThanksEl); })
+    .catch(function() {
+      var offlineMsgs = [];
+      try { offlineMsgs = JSON.parse(localStorage.getItem('autolock_offline_msgs')) || []; } catch(e) {}
+      offlineMsgs.push({ name: name, email: email, phone: offPhone.value.trim(), message: msg, date: new Date().toISOString() });
+      try { localStorage.setItem('autolock_offline_msgs', JSON.stringify(offlineMsgs)); } catch(e) {}
+      showOnly(offlineThanksEl);
+    });
   }
 
-  sseBroadcast(sessionId, 'closed', { session_status: 'closed' });
-  res.json({ closed: true });
-});
+  function openHistory() {
+    var sessions = loadSessions();
+    headerTitle.textContent = 'Tidligere samtaler';
+    historyList.innerHTML = '';
 
-// ── Agent-endpoints (kræver X-Agent-Secret header) ───────────────────────────
+    if (sessions.length === 0) {
+      historyList.innerHTML = '<div id="lc-history-empty">Ingen tidligere samtaler fundet.</div>';
+    } else {
+      sessions.forEach(function(s) {
+        var item = document.createElement('div');
+        item.className = 'lc-session-item';
+        var preview = '—';
+        var customerMsgs = s.messages.filter(function(m) { return m.role === 'customer'; });
+        if (customerMsgs.length > 0) preview = customerMsgs[0].text;
+        if (preview.length > 60) preview = preview.slice(0, 60) + '…';
+        var msgCount = s.messages.filter(function(m) { return m.role !== 'system'; }).length;
+        item.innerHTML =
+          '<div class="lc-si-date">' + formatDate(s.date) + (s.name ? ' · ' + s.name : '') + '</div>' +
+          '<div class="lc-si-preview">' + escHtml(preview) + '</div>' +
+          '<div class="lc-si-count">' + msgCount + ' besked' + (msgCount !== 1 ? 'er' : '') + '</div>';
+        item.addEventListener('click', function() { openSessionDetail(s); });
+        historyList.appendChild(item);
+      });
+    }
+    showOnly(historyEl);
+  }
 
-// GET /sessions – liste over alle sessioner
-app.get('/sessions', requireAgentAuth, async (req, res) => {
-  const { data, error } = await supabase
-    .from('sessions').select('*').order('created_at', { ascending: false }).limit(200);
-  if (error) return res.status(500).json({ error: 'Kunne ikke hente sessioner' });
-  res.json({ sessions: data });
-});
+  historyBackBtn.addEventListener('click', function() {
+    headerTitle.textContent = 'AutoLock Support';
+    updateStatusIndicator();
+    if (historyBackTarget === 'closed') {
+      showOnly(closedEl);
+    } else {
+      if (isOfficeOpen()) {
+        refreshHistoryLink();
+        showOnly(introEl);
+      } else {
+        showOnly(offlineEl);
+      }
+    }
+  });
 
-// GET /messages/:sessionId – hent alle beskeder for en session
-app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
-  const { data, error } = await supabase
-    .from('messages').select('*').eq('session_id', req.params.sessionId).order('id');
-  if (error) return res.status(500).json({ error: 'Kunne ikke hente beskeder' });
-  res.json({ messages: data });
-});
+  function openSessionDetail(session) {
+    detailMsgsEl.innerHTML = '';
+    var rdBadge = document.createElement('div');
+    rdBadge.className = 'lc-readonly-badge';
+    rdBadge.textContent = 'Avslutad konversation – skrivskyddad';
+    detailMsgsEl.appendChild(rdBadge);
+    session.messages.forEach(function(m) {
+      var div = document.createElement('div');
+      div.className = m.role === 'system' ? 'lc-msg lc-msg-system' : 'lc-msg lc-msg-' + m.role;
+      div.textContent = m.text;
+      detailMsgsEl.appendChild(div);
+    });
+    detailMsgsEl.scrollTop = 0;
+    headerTitle.textContent = formatDate(session.date);
+    showOnly(sessionDetailEl);
+  }
 
-// POST /agent/reply – agent sender svar direkte fra dashboard
-app.post('/agent/reply', requireAgentAuth, async (req, res) => {
-  const { sessionId, message } = req.body;
-  if (!sessionId || !message) return res.status(400).json({ error: 'sessionId og message kræves' });
+  detailBackBtn.addEventListener('click', function() {
+    headerTitle.textContent = 'Tidligere samtaler';
+    openHistory();
+  });
 
-  const { data: session, error: sessErr } = await supabase
-    .from('sessions').select('*').eq('id', sessionId).single();
-  if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
-  if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
+  startBtn.addEventListener('click', startSession);
+  nameInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') startSession(); });
 
-  const rawMessage      = sanitizeText(message, 2000);
-  const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
+  function startSession() {
+    var name = nameInput.value.trim();
+    var email = emailInput.value.trim();
+    if (!name)  { showError('Vänligen ange ditt namn.'); nameInput.focus(); return; }
+    if (!email) { showError('Vänligen ange din e-postadress.'); emailInput.focus(); return; }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { showError('Ange en giltig e-postadress.'); emailInput.focus(); return; }
 
-  const { data: msg, error: msgErr } = await supabase
-    .from('messages')
-    .insert({ 
-      session_id: sessionId, 
-      role: 'agent', 
-      text: textForCustomer,
-      text_original: rawMessage 
+    startBtn.disabled = true;
+    startBtn.textContent = 'Startar…';
+    currentMsgs = [];
+
+    fetch(API_BASE + '/session/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // ── RETTET: sender browserens sprog så agentens svar oversættes korrekt ──
+      body: JSON.stringify({
+        name: name,
+        email: email,
+        phone: phoneInput.value.trim() || undefined,
+        lang: 'sv'
+      })
     })
-    .select().single();
-  if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      sessionId = data.session.id;
+      showOnly(chatEl);
+      if (!isOfficeOpen()) {
+        addSystemMsg('  Kunden skrev utanför öppettider (mån–fre 08–16). Återkom så snart som möjligt.');
+      } else {
+        addSystemMsg('Chat startad – en medarbetare från AutoLock återkommer så snart som möjligt.');
+      }
+      msgInput.focus();
+      startPolling();
+    })
+    .catch(function() {
+      showError('Kunde inte ansluta. Försök igen.');
+      startBtn.disabled = false;
+      startBtn.textContent = 'Start chat';
+    });
+  }
 
-  clearReminder(sessionId);
-  sseBroadcast(sessionId, 'message', { ...msg, text: textForCustomer, originalText: rawMessage });
-  res.json({ message: msg });
-});
+  sendBtn.addEventListener('click', sendMessage);
+  msgInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+  msgInput.addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 80) + 'px';
+  });
 
-// POST /agent/translate – manuel oversættelse fra dashboard
-app.post('/agent/translate', requireAgentAuth, async (req, res) => {
-  const text       = sanitizeText(req.body.text || '', 2000);
-  const targetLang = sanitizeLang(req.body.targetLang);
+  function sendMessage() {
+    var text = msgInput.value.trim();
+    if (!text || !sessionId) return;
+    msgInput.value = '';
+    msgInput.style.height = 'auto';
+    addMsg('customer', text);
+    fetch(API_BASE + '/message/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Session-Id': sessionId },
+      body: JSON.stringify({ message: text })
+    }).catch(function() { showError('Meddelandet kunde inte skickas.'); });
+  }
 
-  if (!text) return res.status(400).json({ error: 'Text is required' });
-  if (!req.body.targetLang) return res.status(400).json({ error: 'targetLang is required' });
+  var sseSource = null;
 
-  const translated = await translateToCustomerLang(text, targetLang);
-  res.json({ translated });
-});
+  function startPolling() {
+    if (sseSource || !sessionId) return;
+    sseSource = new EventSource(API_BASE + '/message/sse?session_id=' + sessionId);
+    sseSource.addEventListener('message', function(e) {
+      var m = JSON.parse(e.data);
+      if (m.role === 'agent') {
+        addMsg('agent', m.text);
+        if (!isOpen) badge.style.display = 'block';
+      }
+    });
+    sseSource.addEventListener('closed', function() { handleClosed(); });
+    sseSource.onerror = function() {
+      // SSE reconnects automatically – ingen handling nødvendig
+    };
+  }
 
-// ── GET /health ───────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
+  function stopPolling() {
+    if (sseSource) { sseSource.close(); sseSource = null; }
+  }
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'login.html'));
-});
+  function handleClosed() {
+    var name = nameInput.value.trim() || 'Anonym';
+    if (sessionId) saveSession(sessionId, name, currentMsgs.slice());
+    sessionId = null;
+    stopPolling();
+    showOnly(closedEl);
+  }
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-const port = CONFIG.port;
-app.listen(port, () => {
-  console.log(`✅ Livechat server kører på port ${port}`);
-  console.log(`   Tilladte origins: ${CONFIG.allowedOrigins.join(', ')}`);
-  console.log(`   Teams webhook sat: ${CONFIG.teamsWebhookUrl ? 'ja' : '⚠️  mangler TEAMS_WEBHOOK_URL'}`);
-});
+  endBtn.addEventListener('click', function() {
+    if (!sessionId) return;
+    stopPolling();
+    fetch(API_BASE + '/session/close', { method: 'POST', headers: { 'X-Session-Id': sessionId } })
+    .then(function() { handleClosed(); }).catch(function() { handleClosed(); });
+  });
 
-module.exports = app; // kræves af Vercel
+  newChatBtn.addEventListener('click', function() {
+    lastMsgId = 0;
+    currentMsgs = [];
+    messagesEl.innerHTML = '';
+    nameInput.value = '';
+    emailInput.value = '';
+    phoneInput.value = '';
+    startBtn.disabled = false;
+    startBtn.textContent = 'Start chat';
+    msgInput.value = '';
+    msgInput.style.height = 'auto';
+    headerTitle.textContent = 'AutoLock Support';
+    updateStatusIndicator();
+    if (isOfficeOpen()) {
+      refreshHistoryLink();
+      showOnly(introEl);
+      nameInput.focus();
+    } else {
+      showOnly(offlineEl);
+      offName.focus();
+    }
+  });
+
+  function addMsg(role, text) {
+    var div = document.createElement('div');
+    div.className = 'lc-msg lc-msg-' + role;
+    div.textContent = text;
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    currentMsgs.push({ role: role, text: text });
+  }
+
+  function addSystemMsg(text) {
+    var div = document.createElement('div');
+    div.className = 'lc-msg lc-msg-system';
+    div.textContent = text;
+    messagesEl.appendChild(div);
+    currentMsgs.push({ role: 'system', text: text });
+  }
+
+  function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  updateStatusIndicator();
+  refreshHistoryLink();
+
+})();
+</script>
+</body>
+</html>
