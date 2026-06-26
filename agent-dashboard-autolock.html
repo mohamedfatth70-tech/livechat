@@ -55,7 +55,6 @@
   #topbar .status { font-size: 12px; color: var(--text-mute); display: flex; align-items: center; gap: 6px; }
   #topbar .dot { width: 8px; height: 8px; border-radius: 50%; background: #6effa0; box-shadow: 0 0 6px #6effa0; animation: pulse 2s infinite; }
   #topbar .dot.offline { background: #fc8181; box-shadow: 0 0 6px #fc8181; animation: none; }
-  #agent-name-badge { margin-left: 10px; padding: 2px 9px; background: rgba(192,57,43,0.18); border: 1px solid var(--border2); border-radius: 10px; font-size: 11px; color: var(--text-dim); font-weight: 600; letter-spacing: 0.04em; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
 
 
@@ -157,24 +156,6 @@
   .msg-agent { align-self: flex-end; background: linear-gradient(135deg, var(--red) 0%, var(--red-soft) 100%); color: #fff; font-weight: 500; border-bottom-right-radius: 3px; box-shadow: 0 2px 8px rgba(192,57,43,0.35); }
   .msg-system { align-self: center; font-size: 11.5px; color: var(--text-mute); padding: 2px 0; }
 
-  .msg-translate-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; padding: 0 2px; align-self: flex-start; }
-  .lang-badge {
-    font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
-    color: var(--text-dim); background: var(--bg3);
-    border: 1px solid var(--border2); border-radius: 4px;
-    padding: 1px 5px; text-transform: uppercase;
-  }
-  .translate-toggle-btn {
-    font-size: 11px; font-weight: 600; color: var(--red-soft);
-    background: none; border: none; cursor: pointer;
-    padding: 1px 2px; text-decoration: underline;
-    text-decoration-color: transparent;
-    transition: text-decoration-color 0.15s;
-  }
-  .translate-toggle-btn:hover { text-decoration-color: var(--red-soft); }
-  .translate-toggle-btn:disabled { color: var(--text-mute); cursor: wait; text-decoration: none; }
-  .msg-original-note { font-size: 11px; color: var(--text-mute); font-style: italic; margin-top: 3px; }
-
   #no-chat {
     flex: 1; display: flex; align-items: center;
     justify-content: center; flex-direction: column;
@@ -243,7 +224,7 @@
   <div class="status">
     <span class="dot offline" id="status-dot"></span>
     <span id="status-text">Forbinder...</span>
-    <span id="agent-name-badge"></span>
+    <span id="agent-name-badge" style="margin-left:10px;padding:2px 9px;background:rgba(192,57,43,0.18);border:1px solid var(--border2);border-radius:10px;font-size:11px;color:var(--text-dim);font-weight:600;letter-spacing:0.04em;"></span>
   </div>
 </div>
 
@@ -290,10 +271,6 @@
   var AGENT_SECRET = 'p2nh7wqt5xm3rvkd8bjyfe6lcs4aguoz';
   var sessions = {};          // id -> { id, name, email, phone, status, messages: [], unread: 0 }
   var activeSessionId = null;
-  var LANG_NAMES = { da: 'Dansk', sv: 'Svensk', de: 'Tysk', en: 'Engelsk', nb: 'Norsk', fi: 'Finsk', nl: 'Nederlandsk', fr: 'Fransk', es: 'Spansk', pl: 'Polsk' };
-  // Husker hvilken sprog-visning hver kundebesked viser pt: 'da' (standard), 'original', eller en sprogkode ('en' osv. for on-demand-oversættelser)
-  var viewState = {};         // msgKey -> 'da' | 'original' | langCode
-  var onDemandTranslations = {}; // msgKey -> { lang: text }
   // Hent agentens navn fra auth (AutoLockAuth eller MSAL)
   var AGENT_NAME = (typeof AutoLockAuth !== 'undefined' && AutoLockAuth.getUsername && AutoLockAuth.getUsername()) || 'Agent';
   var agentBadge = document.getElementById('agent-name-badge');
@@ -444,7 +421,7 @@
       var sd = sessions[s.id];
       var msgs = sd ? sd.messages : [];
       var last = msgs.length ? msgs[msgs.length - 1] : null;
-      var preview = last ? (last.text_original || last.text) : 'Chat startet';
+      var preview = last ? last.text : 'Chat startet';
       var hasUnread = sd && sd.unread > 0;
       var isClosed = s.status !== 'open';
       var initials = s.name.split(' ').map(function(w) { return w[0]; }).join('').toUpperCase().slice(0, 2);
@@ -552,7 +529,7 @@
             added = true;
             if (m.role === 'customer' && sessionId !== activeSessionId) {
               s.unread++;
-              showToast((s.name || 'Kunde') + ': ' + (m.text_original || m.text).slice(0, 60));
+              showToast((s.name || 'Kunde') + ': ' + m.text.slice(0, 60));
             }
           }
         });
@@ -568,7 +545,7 @@
   }
 
   function msgKey(m) {
-    return (m.id || '') + '|' + (m.role || '') + '|' + ((m.text_original || m.text) || '').slice(0, 40);
+    return (m.id || '') + '|' + (m.role || '') + '|' + (m.text || '').slice(0, 40);
   }
 
   function appendMessageEl(msg, customerName) {
@@ -587,151 +564,13 @@
 
       var div = document.createElement('div');
       div.className = 'msg msg-' + msg.role;
-      div.textContent = msg.text_original || msg.text;
+      div.textContent = msg.text;
 
       wrap.appendChild(label);
       wrap.appendChild(div);
-
-      // Alle kundebeskeder kan oversættes manuelt fra dashboard.
-      if (msg.role === 'customer') {
-        wrap.appendChild(buildTranslateRow(msg, div));
-      }
     }
 
     messagesEl.appendChild(wrap);
-  }
-
-  // Bygger badge + "Vis original/Vis dansk"-knap-rækken under en kundebesked,
-  // og opdaterer selve beskedteksten (textDiv) når agenten skifter visning.
-  function buildTranslateRow(msg, textDiv) {
-    var key = msgKey(msg);
-    var row = document.createElement('div');
-    row.className = 'msg-translate-row';
-
-    var badge = document.createElement('span');
-    badge.className = 'lang-badge';
-
-    var toggleBtn = document.createElement('button');
-    toggleBtn.className = 'translate-toggle-btn';
-    var hasOriginal = !!msg.original_text;
-    if (!hasOriginal) toggleBtn.style.display = 'none';
-
-    function render() {
-      var state = viewState[key] || 'da';
-      if (state === 'da') {
-        badge.textContent = msg.original_lang ? (LANG_NAMES[msg.original_lang] || msg.original_lang.toUpperCase()) : 'DA';
-        toggleBtn.textContent = 'Vis original';
-        textDiv.textContent = msg.text;
-      } else if (state === 'original') {
-        badge.textContent = LANG_NAMES[msg.original_lang] || msg.original_lang.toUpperCase();
-        toggleBtn.textContent = 'Vis dansk';
-        textDiv.textContent = msg.original_text;
-      } else {
-        // on-demand-oversat sprog
-        badge.textContent = LANG_NAMES[state] || state.toUpperCase();
-        toggleBtn.textContent = 'Vis dansk';
-        textDiv.textContent = (onDemandTranslations[key] && onDemandTranslations[key][state]) || msg.text;
-      }
-    }
-
-    toggleBtn.addEventListener('click', function() {
-      if (!hasOriginal) return;
-      // Fra dansk -> vis original. Fra original ELLER et on-demand-sprog -> tilbage til dansk.
-      viewState[key] = (viewState[key] || 'da') === 'da' ? 'original' : 'da';
-      render();
-    });
-
-    var moreBtn = document.createElement('button');
-    moreBtn.className = 'translate-toggle-btn';
-    moreBtn.textContent = '⋯';
-    moreBtn.title = 'Oversæt til andet sprog';
-    moreBtn.addEventListener('click', function() {
-      openLangPicker(moreBtn, function(lang) {
-        translateOnDemand(msg, lang, toggleBtn, render);
-      });
-    });
-
-    render();
-    row.appendChild(badge);
-    row.appendChild(toggleBtn);
-    row.appendChild(moreBtn);
-    return row;
-  }
-
-  // Lille dropdown med sprogvalg, vist lige under den klikkede knap.
-  function openLangPicker(anchorEl, onPick) {
-    var existing = document.getElementById('lang-picker');
-    if (existing) existing.remove();
-
-    var picker = document.createElement('div');
-    picker.id = 'lang-picker';
-    picker.style.cssText = 'position:absolute;background:var(--bg3);border:1px solid var(--border2);' +
-      'border-radius:8px;padding:4px;box-shadow:0 4px 16px rgba(0,0,0,0.4);z-index:50;display:flex;flex-direction:column;min-width:110px;';
-
-    Object.keys(LANG_NAMES).forEach(function(code) {
-      var item = document.createElement('button');
-      item.textContent = LANG_NAMES[code];
-      item.style.cssText = 'background:none;border:none;color:var(--text);font-size:12px;text-align:left;' +
-        'padding:6px 8px;border-radius:5px;cursor:pointer;';
-      item.addEventListener('mouseenter', function() { this.style.background = 'var(--bg4)'; });
-      item.addEventListener('mouseleave', function() { this.style.background = 'none'; });
-      item.addEventListener('click', function(e) {
-        e.stopPropagation();
-        picker.remove();
-        onPick(code);
-      });
-      picker.appendChild(item);
-    });
-
-    var rect = anchorEl.getBoundingClientRect();
-    picker.style.top = (rect.bottom + window.scrollY + 4) + 'px';
-    picker.style.left = (rect.left + window.scrollX) + 'px';
-    document.body.appendChild(picker);
-
-    function closeOnOutsideClick(e) {
-      if (!picker.contains(e.target)) {
-        picker.remove();
-        document.removeEventListener('click', closeOnOutsideClick);
-      }
-    }
-    setTimeout(function() { document.addEventListener('click', closeOnOutsideClick); }, 0);
-  }
-
-  // Kalder /agent/translate for at oversætte en kundebesked on-demand til et valgt sprog.
-  // Caches resultatet i onDemandTranslations, så vi ikke spørger MyMemory igen ved gentagne klik.
-  function translateOnDemand(msg, lang, toggleBtn, render) {
-    var key = msgKey(msg);
-    var cached = onDemandTranslations[key] && onDemandTranslations[key][lang];
-    if (cached) {
-      viewState[key] = lang;
-      render();
-      return;
-    }
-
-    var sourceText = msg.original_text || msg.text;
-    var prevLabel = toggleBtn.textContent;
-    toggleBtn.disabled = true;
-    toggleBtn.textContent = 'Oversætter…';
-
-    fetch(API_BASE + '/agent/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
-      body: JSON.stringify({ text: sourceText, targetLang: lang })
-    })
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        toggleBtn.disabled = false;
-        if (!data.translated) { showToast('Oversættelse mislykkedes'); toggleBtn.textContent = prevLabel; return; }
-        onDemandTranslations[key] = onDemandTranslations[key] || {};
-        onDemandTranslations[key][lang] = data.translated;
-        viewState[key] = lang;
-        render();
-      })
-      .catch(function() {
-        toggleBtn.disabled = false;
-        toggleBtn.textContent = prevLabel;
-        showToast('Oversættelse mislykkedes');
-      });
   }
 
   function scrollMessages() {
