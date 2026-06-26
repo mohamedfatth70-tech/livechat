@@ -472,13 +472,3 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'login.html'));
 });
-
-// ─── Start ────────────────────────────────────────────────────────────────────
-const port = CONFIG.port;
-app.listen(port, () => {
-  console.log(`✅ Livechat server kører på port ${port}`);
-  console.log(`   Tilladte origins: ${CONFIG.allowedOrigins.join(', ')}`);
-  console.log(`   Teams webhook sat: ${CONFIG.teamsWebhookUrl ? 'ja' : '⚠️  mangler TEAMS_WEBHOOK_URL'}`);
-});
-
-module.exports = app; // kræves af Vercel
