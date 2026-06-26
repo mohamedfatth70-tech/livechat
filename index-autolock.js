@@ -331,7 +331,9 @@ function parseAgentReply(raw) {
   if (!shortId || !message) return null;
   return { shortId, message };
 }
-
+app.get('/widget', (req, res) => {
+  res.sendFile(path.join(__dirname, 'livechat-widget-autolock.html'));
+});
 // ─── Express app ──────────────────────────────────────────────────────────────
 
 const app = express();
@@ -340,6 +342,9 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'livechat-widget-autolock.html'));
 });
 app.get('/livechat-widget-autolock.html', (req, res) => {
+  res.sendFile(path.join(__dirname, 'livechat-widget-autolock.html'));
+});
+app.get('/widget', (req, res) => {
   res.sendFile(path.join(__dirname, 'livechat-widget-autolock.html'));
 });
 app.use(express.static(path.join(__dirname, 'public')));
