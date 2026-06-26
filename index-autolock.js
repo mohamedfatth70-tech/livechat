@@ -1,6 +1,48 @@
-'use strict';
+/**
+ * AutoLock Livechat – Vercel + Supabase
+ *
+ * Ændringer fra original:
+ *  - In-memory Map() erstattet med Supabase (PostgreSQL)
+ *  - Long-polling erstattet med Server-Sent Events (SSE)
+ *  - Rate limiting på /session/start og /message/send
+ *  - Auth-middleware på agent-endpoints (/sessions, /messages, /agent/reply)
+ *  - CORS begrænset til kendte domæner via ALLOWED_ORIGINS env-variabel
+ *  - Input-validering og maks-længder på alle endpoints
+ *  - Webhook-secret valideres altid (ingen usikker fallback)
+ *
+ * Supabase tabeller (kør i Supabase SQL editor):
+ * ─────────────────────────────────────────────
+ * CREATE TABLE sessions (
+ *   id          TEXT PRIMARY KEY,
+ *   name        TEXT NOT NULL,
+ *   email       TEXT,
+ *   phone       TEXT,
+ *   lang        TEXT DEFAULT 'da',
+ *   status      TEXT DEFAULT 'open',
+ *   created_at  TIMESTAMPTZ DEFAULT now()
+ * );
+ *
+ * CREATE TABLE messages (
+ *   id          BIGSERIAL PRIMARY KEY,
+ *   session_id  TEXT REFERENCES sessions(id),
+ *   role        TEXT NOT NULL,  -- 'customer' eller 'agent'
+ *   text        TEXT NOT NULL,
+ *   created_at  TIMESTAMPTZ DEFAULT now()
+ * );
+ *
+ * CREATE INDEX ON messages(session_id, id);
+ * ─────────────────────────────────────────────
+ *
+ * Miljøvariabler (sæt i Vercel dashboard):
+ *   SUPABASE_URL          – Fra Supabase → Project Settings → API
+ *   SUPABASE_SERVICE_KEY  – Fra Supabase → Project Settings → API (service_role nøgle)
+ *   WEBHOOK_SECRET        – Hemmeligt token delt med Power Automate
+ *   AGENT_SECRET          – Hemmeligt token til agent-dashboard (sæt samme i agent-dashboard HTML)
+ *   TEAMS_WEBHOOK_URL     – Power Automate webhook URL
+ *   ALLOWED_ORIGINS       – Kommasepareret: https://autolock.dk,https://autolock.se,...
+ */
 
-require('dotenv').config();
+'use strict';
 
 const express  = require('express');
 const https    = require('https');
@@ -10,30 +52,30 @@ const path = require('path');
 
 // ─── Konfiguration ────────────────────────────────────────────────────────────
 
+const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WEBHOOK_SECRET', 'AGENT_SECRET'];
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`[boot] FEJL: Miljøvariabel '${key}' mangler. Sæt den i Vercel dashboard.`);
+    process.exit(1);
+  }
+}
+
 const CONFIG = {
   port:            process.env.PORT || 3001,
   teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL || '',
-  webhookSecret:   process.env.WEBHOOK_SECRET || 'dev-webhook-secret',
-  agentSecret:     process.env.AGENT_SECRET || 'dev-agent-secret',
+  webhookSecret:   process.env.WEBHOOK_SECRET,
+  agentSecret:     process.env.AGENT_SECRET,
   replyTrigger:    '!svar',
-  allowedOrigins:  (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || 'http://localhost:3001,http://127.0.0.1:3001,null')
+  allowedOrigins:  (process.env.ALLOWED_ORIGINS || 'http://localhost:3001')
                      .split(',').map(s => s.trim()).filter(Boolean),
 };
 
-const USE_SUPABASE = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY);
+// ─── Supabase ─────────────────────────────────────────────────────────────────
 
-// ─── Supabase eller lokal fallback ──────────────────────────────────────────
-
-const supabase = USE_SUPABASE
-  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
-  : null;
-
-const memorySessions = new Map();
-const memoryMessages = new Map();
-
-if (!USE_SUPABASE) {
-  console.warn('[boot] Supabase ikke konfigureret – bruger hukommelseslagring i lokal udvikling.');
-}
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
 // ─── SSE: aktive lyttere pr. session ──────────────────────────────────────────
 // Map<sessionId, Set<res>>
@@ -107,102 +149,6 @@ function sanitizeText(str, maxLen = 2000) {
   return str.trim().slice(0, maxLen);
 }
 
-async function createSessionRecord(id, name, email, phone, lang) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase.from('sessions').insert({ id, name, email, phone, lang, status: 'open' });
-    return { data, error };
-  }
-
-  const session = {
-    id,
-    name,
-    email,
-    phone,
-    lang,
-    status: 'open',
-    created_at: new Date().toISOString(),
-  };
-  memorySessions.set(id, session);
-  memoryMessages.set(id, []);
-  return { data: session, error: null };
-}
-
-async function getSessionRecord(sessionId) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase.from('sessions').select('*').eq('id', sessionId).single();
-    return { data, error };
-  }
-  return { data: memorySessions.get(sessionId) || null, error: null };
-}
-
-async function getSessionStatus(sessionId) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase.from('sessions').select('status').eq('id', sessionId).single();
-    return { data: data?.status || null, error };
-  }
-  const session = memorySessions.get(sessionId);
-  return { data: session?.status || null, error: null };
-}
-
-async function addMessageRecord(sessionId, role, text, textOriginal) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
-      .from('messages')
-      .insert({ session_id: sessionId, role, text, text_original: textOriginal || text })
-      .select()
-      .single();
-    return { data, error };
-  }
-
-  const msg = {
-    id: makeId(),
-    session_id: sessionId,
-    role,
-    text,
-    text_original: textOriginal || text,
-    created_at: new Date().toISOString(),
-  };
-  const messages = memoryMessages.get(sessionId) || [];
-  messages.push(msg);
-  memoryMessages.set(sessionId, messages);
-  return { data: msg, error: null };
-}
-
-async function updateSessionStatusRecord(sessionId, status) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase.from('sessions').update({ status }).eq('id', sessionId).select().single();
-    return { data, error };
-  }
-
-  const session = memorySessions.get(sessionId);
-  if (session) {
-    session.status = status;
-    memorySessions.set(sessionId, session);
-  }
-  return { data: session || null, error: null };
-}
-
-async function listSessionsRecord() {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase.from('sessions').select('*').order('created_at', { ascending: false }).limit(200);
-    return { data, error };
-  }
-
-  const sessions = Array.from(memorySessions.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  return { data: sessions, error: null };
-}
-
-async function findOpenSessionByShortId(shortId) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
-      .from('sessions').select('*').eq('status', 'open').ilike('id', `${shortId}%`).limit(1);
-    return { data: data?.[0] || null, error };
-  }
-
-  const session = Array.from(memorySessions.values()).find(item => item.status === 'open' && item.id.startsWith(shortId));
-  return { data: session || null, error: null };
-}
-
 // ─── Oversættelse via MyMemory ────────────────────────────────────────────────
 
 function httpGet(url) {
@@ -220,13 +166,9 @@ async function detectAndTranslateToDanish(text) {
   try {
     const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=autodetect|da`);
     const json = JSON.parse(raw);
-    const detected = (json.matches?.[0]?.source || json.responseData?.match?.source || 'da').toLowerCase();
-    if (detected === 'da') {
-      return { translated: text, detectedLang: 'da' };
-    }
     return {
       translated:   json.responseData?.translatedText || text,
-      detectedLang: detected,
+      detectedLang: json.matches?.[0]?.source || 'da',
     };
   } catch { return { translated: text, detectedLang: 'da' }; }
 }
@@ -331,32 +273,19 @@ function parseAgentReply(raw) {
   if (!shortId || !message) return null;
   return { shortId, message };
 }
-app.get('/widget', (req, res) => {
-  res.sendFile(path.join(__dirname, 'livechat-widget-autolock.html'));
-});
+
 // ─── Express app ──────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'livechat-widget-autolock.html'));
-});
-app.get('/livechat-widget-autolock.html', (req, res) => {
-  res.sendFile(path.join(__dirname, 'livechat-widget-autolock.html'));
-});
-app.get('/widget', (req, res) => {
-  res.sendFile(path.join(__dirname, 'livechat-widget-autolock.html'));
-});
 app.use(express.static(path.join(__dirname, 'public')));
 
 // CORS – kun kendte origins
 app.use((req, res, next) => {
-  const origin = req.headers.origin || '';
-  if (origin) {
+  const origin = req.headers.origin;
+  if (origin && CONFIG.allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-Webhook-Secret, X-Agent-Secret');
@@ -374,7 +303,7 @@ app.post('/session/start',
     const lang  = sanitizeLang(req.body.lang);
     const id    = makeId();
 
-    const { error } = await createSessionRecord(id, name, email, phone, lang);
+    const { error } = await supabase.from('sessions').insert({ id, name, email, phone, lang, status: 'open' });
     if (error) { console.error('[session/start]', error); return res.status(500).json({ error: 'Kunne ikke oprette session' }); }
 
     await postToTeams(adaptiveCard([
@@ -402,16 +331,26 @@ app.post('/message/send',
     if (!sessionId) return res.status(400).json({ error: 'X-Session-Id header mangler' });
     if (!text)      return res.status(400).json({ error: 'Besked må ikke være tom' });
 
-    const { data: session, error: sessErr } = await getSessionRecord(sessionId);
+    const { data: session, error: sessErr } = await supabase
+      .from('sessions').select('*').eq('id', sessionId).single();
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    // Gem både original og oversatt tekst (for customer messages er de ens)
-    const { data: msg, error: msgErr } = await addMessageRecord(sessionId, 'customer', text, text);
+    const { translated: textForAgent, detectedLang } = await detectAndTranslateToDanish(text);
+
+    // Opdater sprog på sessionen hvis auto-detektion finder et ikke-dansk sprog
+    if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
+      await supabase.from('sessions').update({ lang: detectedLang }).eq('id', sessionId);
+      session.lang = detectedLang;
+    }
+
+    const { data: msg, error: msgErr } = await supabase
+      .from('messages').insert({ session_id: sessionId, role: 'customer', text: textForAgent })
+      .select().single();
     if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
     scheduleReminder(session);
-    await sendToTeams(sessionId, session.name, text);
+    await sendToTeams(sessionId, session.name, textForAgent);
 
     res.json({ message: msg });
   }
@@ -419,10 +358,6 @@ app.post('/message/send',
 
 // ── GET /message/sse – Server-Sent Events (erstatter long-poll) ───────────────
 // Widget lytter her efter agent-svar i realtid.
-app.get('/health', (req, res) => {
-  res.json({ ok: true, mode: USE_SUPABASE ? 'supabase' : 'memory' });
-});
-
 app.get('/message/sse', (req, res) => {
   const sessionId = req.headers['x-session-id'] || req.query.session_id;
   if (!sessionId) return res.status(400).json({ error: 'session_id mangler' });
@@ -448,17 +383,21 @@ app.post('/webhook/teams', async (req, res) => {
   const parsed = parseAgentReply(raw);
   if (!parsed) return res.json({ ignored: true, reason: 'Ikke et !svar-kommando' });
 
-  const { data: session, error: sessionErr } = await findOpenSessionByShortId(parsed.shortId);
-  if (sessionErr || !session) return res.json({ ignored: true, reason: 'Session ikke fundet' });
+  // Find session via short ID
+  const { data: sessions } = await supabase
+    .from('sessions').select('*').eq('status', 'open').ilike('id', `${parsed.shortId}%`).limit(1);
+  const session = sessions?.[0];
+  if (!session) return res.json({ ignored: true, reason: 'Session ikke fundet' });
 
-  const rawMessage      = parsed.message;
-  const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
+  const textForCustomer = await translateToCustomerLang(parsed.message, session.lang || 'da');
 
-  const { data: msg, error } = await addMessageRecord(session.id, 'agent', textForCustomer, rawMessage);
+  const { data: msg, error } = await supabase
+    .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer })
+    .select().single();
   if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
   clearReminder(session.id);
-  sseBroadcast(session.id, 'message', { ...msg, text: textForCustomer, originalText: rawMessage });
+  sseBroadcast(session.id, 'message', msg); // push til widget via SSE
   res.json({ saved: true, message: msg });
 });
 
@@ -467,8 +406,8 @@ app.post('/session/close', async (req, res) => {
   const sessionId = req.headers['x-session-id'];
   if (!sessionId) return res.status(400).json({ error: 'X-Session-Id header mangler' });
 
-  const { data: session } = await getSessionRecord(sessionId);
-  await updateSessionStatusRecord(sessionId, 'closed');
+  const { data: session } = await supabase.from('sessions').select('name').eq('id', sessionId).single();
+  await supabase.from('sessions').update({ status: 'closed' }).eq('id', sessionId);
   clearReminder(sessionId);
 
   if (session) {
@@ -489,7 +428,8 @@ app.post('/session/close', async (req, res) => {
 
 // GET /sessions – liste over alle sessioner
 app.get('/sessions', requireAgentAuth, async (req, res) => {
-  const { data, error } = await listSessionsRecord();
+  const { data, error } = await supabase
+    .from('sessions').select('*').order('created_at', { ascending: false }).limit(200);
   if (error) return res.status(500).json({ error: 'Kunne ikke hente sessioner' });
   res.json({ sessions: data });
 });
@@ -512,35 +452,16 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  const rawMessage      = sanitizeText(message, 2000);
-  const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
+  const textForCustomer = await translateToCustomerLang(sanitizeText(message, 2000), session.lang || 'da');
 
   const { data: msg, error: msgErr } = await supabase
-    .from('messages')
-    .insert({ 
-      session_id: sessionId, 
-      role: 'agent', 
-      text: textForCustomer,
-      text_original: rawMessage 
-    })
+    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
     .select().single();
   if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
   clearReminder(sessionId);
-  sseBroadcast(sessionId, 'message', { ...msg, text: textForCustomer, originalText: rawMessage });
+  sseBroadcast(sessionId, 'message', msg);
   res.json({ message: msg });
-});
-
-// POST /agent/translate – manuel oversættelse fra dashboard
-app.post('/agent/translate', requireAgentAuth, async (req, res) => {
-  const text       = sanitizeText(req.body.text || '', 2000);
-  const targetLang = sanitizeLang(req.body.targetLang);
-
-  if (!text) return res.status(400).json({ error: 'Text is required' });
-  if (!req.body.targetLang) return res.status(400).json({ error: 'targetLang is required' });
-
-  const translated = await translateToCustomerLang(text, targetLang);
-  res.json({ translated });
 });
 
 // ── GET /health ───────────────────────────────────────────────────────────────
