@@ -1,3 +1,47 @@
+/**
+ * AutoLock Livechat – Vercel + Supabase
+ *
+ * Ændringer fra original:
+ *  - In-memory Map() erstattet med Supabase (PostgreSQL)
+ *  - Long-polling erstattet med Server-Sent Events (SSE)
+ *  - Rate limiting på /session/start og /message/send
+ *  - Auth-middleware på agent-endpoints (/sessions, /messages, /agent/reply)
+ *  - CORS begrænset til kendte domæner via ALLOWED_ORIGINS env-variabel
+ *  - Input-validering og maks-længder på alle endpoints
+ *  - Webhook-secret valideres altid (ingen usikker fallback)
+ *
+ * Supabase tabeller (kør i Supabase SQL editor):
+ * ─────────────────────────────────────────────
+ * CREATE TABLE sessions (
+ *   id          TEXT PRIMARY KEY,
+ *   name        TEXT NOT NULL,
+ *   email       TEXT,
+ *   phone       TEXT,
+ *   lang        TEXT DEFAULT 'da',
+ *   status      TEXT DEFAULT 'open',
+ *   created_at  TIMESTAMPTZ DEFAULT now()
+ * );
+ *
+ * CREATE TABLE messages (
+ *   id          BIGSERIAL PRIMARY KEY,
+ *   session_id  TEXT REFERENCES sessions(id),
+ *   role        TEXT NOT NULL,  -- 'customer' eller 'agent'
+ *   text        TEXT NOT NULL,
+ *   created_at  TIMESTAMPTZ DEFAULT now()
+ * );
+ *
+ * CREATE INDEX ON messages(session_id, id);
+ * ─────────────────────────────────────────────
+ *
+ * Miljøvariabler (sæt i Vercel dashboard):
+ *   SUPABASE_URL          – Fra Supabase → Project Settings → API
+ *   SUPABASE_SERVICE_KEY  – Fra Supabase → Project Settings → API (service_role nøgle)
+ *   WEBHOOK_SECRET        – Hemmeligt token delt med Power Automate
+ *   AGENT_SECRET          – Hemmeligt token til agent-dashboard (sæt samme i agent-dashboard HTML)
+ *   TEAMS_WEBHOOK_URL     – Power Automate webhook URL
+ *   ALLOWED_ORIGINS       – Kommasepareret: https://autolock.dk,https://autolock.se,...
+ */
+
 'use strict';
 
 const express  = require('express');
@@ -122,13 +166,9 @@ async function detectAndTranslateToDanish(text) {
   try {
     const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=autodetect|da`);
     const json = JSON.parse(raw);
-    const detected = (json.matches?.[0]?.source || json.responseData?.match?.source || 'da').toLowerCase();
-    if (detected === 'da') {
-      return { translated: text, detectedLang: 'da' };
-    }
     return {
       translated:   json.responseData?.translatedText || text,
-      detectedLang: detected,
+      detectedLang: json.matches?.[0]?.source || 'da',
     };
   } catch { return { translated: text, detectedLang: 'da' }; }
 }
@@ -296,19 +336,21 @@ app.post('/message/send',
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    // Gem både original og oversatt tekst (for customer messages er de ens)
+    const { translated: textForAgent, detectedLang } = await detectAndTranslateToDanish(text);
+
+    // Opdater sprog på sessionen hvis auto-detektion finder et ikke-dansk sprog
+    if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
+      await supabase.from('sessions').update({ lang: detectedLang }).eq('id', sessionId);
+      session.lang = detectedLang;
+    }
+
     const { data: msg, error: msgErr } = await supabase
-      .from('messages').insert({ 
-        session_id: sessionId, 
-        role: 'customer', 
-        text: text, 
-        text_original: text 
-      })
+      .from('messages').insert({ session_id: sessionId, role: 'customer', text: textForAgent })
       .select().single();
     if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
     scheduleReminder(session);
-    await sendToTeams(sessionId, session.name, text);
+    await sendToTeams(sessionId, session.name, textForAgent);
 
     res.json({ message: msg });
   }
@@ -341,27 +383,21 @@ app.post('/webhook/teams', async (req, res) => {
   const parsed = parseAgentReply(raw);
   if (!parsed) return res.json({ ignored: true, reason: 'Ikke et !svar-kommando' });
 
+  // Find session via short ID
   const { data: sessions } = await supabase
     .from('sessions').select('*').eq('status', 'open').ilike('id', `${parsed.shortId}%`).limit(1);
   const session = sessions?.[0];
   if (!session) return res.json({ ignored: true, reason: 'Session ikke fundet' });
 
-  const rawMessage      = parsed.message;
-  const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
+  const textForCustomer = await translateToCustomerLang(parsed.message, session.lang || 'da');
 
   const { data: msg, error } = await supabase
-    .from('messages')
-    .insert({ 
-      session_id: session.id, 
-      role: 'agent', 
-      text: textForCustomer,
-      text_original: rawMessage 
-    })
+    .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer })
     .select().single();
   if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
   clearReminder(session.id);
-  sseBroadcast(session.id, 'message', { ...msg, text: textForCustomer, originalText: rawMessage });
+  sseBroadcast(session.id, 'message', msg); // push til widget via SSE
   res.json({ saved: true, message: msg });
 });
 
@@ -416,35 +452,16 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  const rawMessage      = sanitizeText(message, 2000);
-  const textForCustomer = await translateToCustomerLang(rawMessage, session.lang || 'da');
+  const textForCustomer = await translateToCustomerLang(sanitizeText(message, 2000), session.lang || 'da');
 
   const { data: msg, error: msgErr } = await supabase
-    .from('messages')
-    .insert({ 
-      session_id: sessionId, 
-      role: 'agent', 
-      text: textForCustomer,
-      text_original: rawMessage 
-    })
+    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
     .select().single();
   if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
   clearReminder(sessionId);
-  sseBroadcast(sessionId, 'message', { ...msg, text: textForCustomer, originalText: rawMessage });
+  sseBroadcast(sessionId, 'message', msg);
   res.json({ message: msg });
-});
-
-// POST /agent/translate – manuel oversættelse fra dashboard
-app.post('/agent/translate', requireAgentAuth, async (req, res) => {
-  const text       = sanitizeText(req.body.text || '', 2000);
-  const targetLang = sanitizeLang(req.body.targetLang);
-
-  if (!text) return res.status(400).json({ error: 'Text is required' });
-  if (!req.body.targetLang) return res.status(400).json({ error: 'targetLang is required' });
-
-  const translated = await translateToCustomerLang(text, targetLang);
-  res.json({ translated });
 });
 
 // ── GET /health ───────────────────────────────────────────────────────────────
