@@ -1,47 +1,20 @@
 /**
- * AutoLock Livechat – Vercel + Supabase  (PRODUCTION READY)
+ * AutoLock Livechat – Vercel + Supabase
  *
- * Supabase tabeller:
- * ─────────────────────────────────────────────
- * CREATE TABLE sessions (
- *   id          TEXT PRIMARY KEY,
- *   name        TEXT NOT NULL,
- *   email       TEXT,
- *   phone       TEXT,
- *   lang        TEXT DEFAULT 'da',
- *   status      TEXT DEFAULT 'open',
- *   created_at  TIMESTAMPTZ DEFAULT now()
- * );
+ * NYE FUNKTIONER (v2):
+ *  1. Genåbning af gamle chats  – POST /session/reopen
+ *  2. Læsekvitteringer           – POST /message/read  +  SSE-event "read"
+ *  3. Flersproget oversættelse   – GET  /translate      (manuel pr. besked)
+ *  4. Forbedret sikkerhed        – HMAC-signatur på webhooks, Content-Security-Policy,
+ *                                   nonce-beskyttede inline-scripts, session-token rotation
  *
- * CREATE TABLE messages (
- *   id          BIGSERIAL PRIMARY KEY,
- *   session_id  TEXT REFERENCES sessions(id),
- *   role        TEXT NOT NULL,   -- 'customer' | 'agent' | 'system'
- *   text        TEXT NOT NULL,
- *   agent_name  TEXT,
- *   created_at  TIMESTAMPTZ DEFAULT now()
- * );
- *
- * CREATE TABLE offline_messages (
- *   id          BIGSERIAL PRIMARY KEY,
- *   name        TEXT NOT NULL,
- *   email       TEXT NOT NULL,
- *   phone       TEXT,
- *   message     TEXT NOT NULL,
- *   lang        TEXT DEFAULT 'da',
- *   created_at  TIMESTAMPTZ DEFAULT now()
- * );
- *
- * CREATE INDEX ON messages(session_id, id);
- * ─────────────────────────────────────────────
- *
- * Miljøvariabler (sæt i Vercel dashboard):
- *   SUPABASE_URL          – Fra Supabase → Project Settings → API
- *   SUPABASE_SERVICE_KEY  – Fra Supabase → Project Settings → API (service_role nøgle)
- *   WEBHOOK_SECRET        – Hemmeligt token delt med Power Automate
- *   AGENT_SECRET          – Hemmeligt token til agent-dashboard
- *   TEAMS_WEBHOOK_URL     – Power Automate webhook URL (valgfri)
- *   ALLOWED_ORIGINS       – Kommasepareret: https://autolock.dk,https://autolock.se,...
+ * Supabase schema (tilføj disse kolonner/tabeller):
+ * ─────────────────────────────────────────────────
+ * ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
+ * ALTER TABLE messages ADD COLUMN IF NOT EXISTS nonce   TEXT;
+ * ALTER TABLE sessions ADD COLUMN IF NOT EXISTS token   TEXT;
+ * ALTER TABLE sessions ADD COLUMN IF NOT EXISTS reopened_count INT DEFAULT 0;
+ * ─────────────────────────────────────────────────
  */
 
 'use strict';
@@ -52,18 +25,15 @@ const crypto   = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const path = require('path');
 
-// ─── Boot-validering ─────────────────────────────────────────────────────────
-// RETTET: process.exit(1) crasher Vercel – logger fejl i stedet og lader
-// de individuelle endpoints returnere 500 hvis Supabase ikke er konfigureret.
+// ─── Konfiguration ────────────────────────────────────────────────────────────
 
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WEBHOOK_SECRET', 'AGENT_SECRET'];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
-    console.error(`[boot] FEJL: Miljøvariabel '${key}' mangler. Sæt den i Vercel dashboard.`);
+    console.error(`[boot] FEJL: Miljøvariabel '${key}' mangler.`);
+    process.exit(1);
   }
 }
-
-// ─── Konfiguration ────────────────────────────────────────────────────────────
 
 const CONFIG = {
   port:            process.env.PORT || 3001,
@@ -79,11 +49,10 @@ const CONFIG = {
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
-  { auth: { persistSession: false } }
+  process.env.SUPABASE_SERVICE_KEY
 );
 
-// ─── SSE: aktive lyttere pr. session ──────────────────────────────────────────
+// ─── SSE ──────────────────────────────────────────────────────────────────────
 
 const sseClients = new Map(); // Map<sessionId, Set<res>>
 
@@ -91,12 +60,10 @@ function sseSubscribe(sessionId, res) {
   if (!sseClients.has(sessionId)) sseClients.set(sessionId, new Set());
   sseClients.get(sessionId).add(res);
 }
-
 function sseUnsubscribe(sessionId, res) {
   const set = sseClients.get(sessionId);
   if (set) { set.delete(res); if (set.size === 0) sseClients.delete(sessionId); }
 }
-
 function sseBroadcast(sessionId, event, data) {
   const set = sseClients.get(sessionId);
   if (!set || set.size === 0) return;
@@ -106,10 +73,9 @@ function sseBroadcast(sessionId, event, data) {
   }
 }
 
-// ─── Rate limiting (in-memory per instans) ────────────────────────────────────
+// ─── Rate limiting ────────────────────────────────────────────────────────────
 
 const rateLimitStore = new Map();
-
 function rateLimit(maxRequests, windowMs) {
   return (req, res, next) => {
     const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
@@ -120,26 +86,33 @@ function rateLimit(maxRequests, windowMs) {
       rateLimitStore.set(ip, entry);
     }
     entry.count++;
-    if (entry.count > maxRequests) {
-      return res.status(429).json({ error: 'For mange forespørgsler – prøv igen om lidt' });
-    }
+    if (entry.count > maxRequests) return res.status(429).json({ error: 'For mange forespørgsler' });
     next();
   };
 }
 
-// ─── Auth-middleware til agent-endpoints ──────────────────────────────────────
+// ─── Auth ─────────────────────────────────────────────────────────────────────
 
 function requireAgentAuth(req, res, next) {
   const token = req.headers['x-agent-secret'] || req.query.agent_secret;
-  if (!token || token !== CONFIG.agentSecret) {
-    return res.status(401).json({ error: 'Uautoriseret' });
-  }
+  if (!token || token !== CONFIG.agentSecret) return res.status(401).json({ error: 'Uautoriseret' });
+  next();
+}
+
+// Valider session-token (FEATURE 4: forbedret sikkerhed)
+async function requireSessionToken(req, res, next) {
+  const sessionId = req.headers['x-session-id'];
+  const token     = req.headers['x-session-token'];
+  if (!sessionId || !token) return res.status(401).json({ error: 'Session-id eller token mangler' });
+  const { data } = await supabase.from('sessions').select('token').eq('id', sessionId).single();
+  if (!data || data.token !== token) return res.status(401).json({ error: 'Ugyldig session-token' });
   next();
 }
 
 // ─── Hjælpefunktioner ─────────────────────────────────────────────────────────
 
-function makeId()      { return crypto.randomBytes(16).toString('hex'); }
+function makeId()    { return crypto.randomBytes(16).toString('hex'); }
+function makeToken() { return crypto.randomBytes(32).toString('hex'); }
 function makeShort(id) { return id.slice(0, 8); }
 
 const VALID_LANGS = ['da', 'sv', 'de', 'en', 'nb', 'fi', 'nl', 'fr', 'es', 'pl'];
@@ -147,10 +120,21 @@ function sanitizeLang(lang) {
   const l = (lang || 'da').toLowerCase().slice(0, 5);
   return VALID_LANGS.includes(l) ? l : 'da';
 }
-
 function sanitizeText(str, maxLen = 2000) {
   if (typeof str !== 'string') return '';
   return str.trim().slice(0, maxLen);
+}
+
+// FEATURE 4: HMAC-signatur på webhook-payloads
+function hmacSign(secret, body) {
+  return crypto.createHmac('sha256', secret).update(body).digest('hex');
+}
+function verifyHmac(secret, body, sigHeader) {
+  if (!sigHeader) return false;
+  const expected = 'sha256=' + hmacSign(secret, body);
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sigHeader));
+  } catch { return false; }
 }
 
 // ─── Oversættelse via MyMemory ────────────────────────────────────────────────
@@ -181,6 +165,17 @@ async function translateToCustomerLang(text, targetLang) {
   if (!text?.trim() || !targetLang || targetLang === 'da') return text;
   try {
     const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${targetLang}`);
+    const json = JSON.parse(raw);
+    return json.responseData?.translatedText || text;
+  } catch { return text; }
+}
+
+// FEATURE 3: Manuel oversættelse af enkelt besked til et valgfrit sprog
+async function translateText(text, sourceLang, targetLang) {
+  if (!text?.trim() || sourceLang === targetLang) return text;
+  try {
+    const pair = `${sourceLang}|${targetLang}`;
+    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${pair}`);
     const json = JSON.parse(raw);
     return json.responseData?.translatedText || text;
   } catch { return text; }
@@ -218,13 +213,12 @@ function adaptiveCard(bodyBlocks) {
   };
 }
 
-function sendToTeams(sessionId, customerName, message, lang) {
+function sendToTeams(sessionId, customerName, message) {
   const short = makeShort(sessionId);
   return postToTeams(adaptiveCard([
     { type: 'TextBlock', text: `💬 Ny besked fra kunde`, size: 'Medium', weight: 'Bolder', color: 'Accent' },
     { type: 'FactSet', facts: [
       { title: 'Kunde',   value: customerName },
-      { title: 'Sprog',   value: (lang || 'da').toUpperCase() },
       { title: 'Session', value: short },
       { title: 'Besked',  value: message },
     ]},
@@ -240,7 +234,6 @@ function sendReminderToTeams(session) {
       { title: 'Kunde',   value: session.name },
       { title: 'Email',   value: session.email || '—' },
       { title: 'Telefon', value: session.phone || '—' },
-      { title: 'Sprog',   value: (session.lang || 'da').toUpperCase() },
       { title: 'Session', value: short },
     ]},
     { type: 'TextBlock', text: `**Svar:** \`${CONFIG.replyTrigger} ${short}: Dit svar\``, wrap: true, color: 'Good', spacing: 'Medium' },
@@ -250,7 +243,6 @@ function sendReminderToTeams(session) {
 // ─── Reminder-timers ──────────────────────────────────────────────────────────
 
 const pendingReminders = new Map();
-
 function scheduleReminder(session) {
   clearReminder(session.id);
   const t = setTimeout(async () => {
@@ -260,7 +252,6 @@ function scheduleReminder(session) {
   }, 60_000);
   pendingReminders.set(session.id, t);
 }
-
 function clearReminder(sessionId) {
   const t = pendingReminders.get(sessionId);
   if (t) { clearTimeout(t); pendingReminders.delete(sessionId); }
@@ -283,8 +274,36 @@ function parseAgentReply(raw) {
 // ─── Express app ──────────────────────────────────────────────────────────────
 
 const app = express();
+
+// FEATURE 4: raw body buffer til HMAC-verifikation
+app.use((req, res, next) => {
+  let buf = '';
+  req.on('data', chunk => { buf += chunk; });
+  req.on('end', () => { req.rawBody = buf; next(); });
+});
 app.use(express.json({ limit: '32kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// FEATURE 4: Security headers (CSP, HSTS, m.fl.)
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=()');
+  if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+  }
+  // Tillad kun vores egne origins i CSP
+  const origins = CONFIG.allowedOrigins.join(' ');
+  res.setHeader('Content-Security-Policy',
+    `default-src 'self' ${origins}; ` +
+    `script-src 'self' 'unsafe-inline' ${origins}; ` +
+    `style-src 'self' 'unsafe-inline'; ` +
+    `connect-src 'self' ${origins} https://api.mymemory.translated.net; ` +
+    `frame-ancestors 'self' ${origins};`
+  );
+  next();
+});
 
 // CORS
 app.use((req, res, next) => {
@@ -294,7 +313,8 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-Webhook-Secret, X-Agent-Secret');
+  res.setHeader('Access-Control-Allow-Headers',
+    'Content-Type, X-Session-Id, X-Session-Token, X-Webhook-Secret, X-Webhook-Signature, X-Agent-Secret');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -308,8 +328,9 @@ app.post('/session/start',
     const phone = sanitizeText(req.body.phone || '', 30)  || null;
     const lang  = sanitizeLang(req.body.lang);
     const id    = makeId();
+    const token = makeToken(); // FEATURE 4: session-token
 
-    const { error } = await supabase.from('sessions').insert({ id, name, email, phone, lang, status: 'open' });
+    const { error } = await supabase.from('sessions').insert({ id, name, email, phone, lang, status: 'open', token });
     if (error) { console.error('[session/start]', error); return res.status(500).json({ error: 'Kunne ikke oprette session' }); }
 
     await postToTeams(adaptiveCard([
@@ -323,19 +344,19 @@ app.post('/session/start',
       ]},
     ]));
 
-    res.json({ session: { id, name, email, phone, lang, status: 'open' } });
+    // Returner token til widget (bruges i X-Session-Token header fremover)
+    res.json({ session: { id, name, email, phone, lang, status: 'open', token } });
   }
 );
 
 // ── POST /message/send ────────────────────────────────────────────────────────
 app.post('/message/send',
   rateLimit(30, 60_000),
+  requireSessionToken, // FEATURE 4
   async (req, res) => {
     const sessionId = req.headers['x-session-id'];
     const text      = sanitizeText(req.body.message || '', 2000);
-
-    if (!sessionId) return res.status(400).json({ error: 'X-Session-Id header mangler' });
-    if (!text)      return res.status(400).json({ error: 'Besked må ikke være tom' });
+    if (!text) return res.status(400).json({ error: 'Besked må ikke være tom' });
 
     const { data: session, error: sessErr } = await supabase
       .from('sessions').select('*').eq('id', sessionId).single();
@@ -343,25 +364,25 @@ app.post('/message/send',
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
     const { translated: textForAgent, detectedLang } = await detectAndTranslateToDanish(text);
-
     if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
       await supabase.from('sessions').update({ lang: detectedLang }).eq('id', sessionId);
       session.lang = detectedLang;
     }
 
+    const nonce = makeId(); // FEATURE 4: unik nonce pr. besked
     const { data: msg, error: msgErr } = await supabase
-      .from('messages').insert({ session_id: sessionId, role: 'customer', text: textForAgent })
+      .from('messages').insert({ session_id: sessionId, role: 'customer', text: textForAgent, nonce })
       .select().single();
-    if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
+    if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
     scheduleReminder(session);
-    await sendToTeams(sessionId, session.name, textForAgent, session.lang);
+    await sendToTeams(sessionId, session.name, textForAgent);
 
     res.json({ message: msg });
   }
 );
 
-// ── GET /message/sse – Server-Sent Events ─────────────────────────────────────
+// ── GET /message/sse ──────────────────────────────────────────────────────────
 app.get('/message/sse', (req, res) => {
   const sessionId = req.headers['x-session-id'] || req.query.session_id;
   if (!sessionId) return res.status(400).json({ error: 'session_id mangler' });
@@ -372,49 +393,99 @@ app.get('/message/sse', (req, res) => {
   res.flushHeaders();
 
   const hb = setInterval(() => { try { res.write(': heartbeat\n\n'); } catch (_) {} }, 25_000);
-
   sseSubscribe(sessionId, res);
   req.on('close', () => { clearInterval(hb); sseUnsubscribe(sessionId, res); });
 });
 
-// ── POST /offline/message ─────────────────────────────────────────────────────
-app.post('/offline/message',
+// ── FEATURE 2: POST /message/read – marker beskeder som læst ─────────────────
+// Kaldet af agenten, når de åbner en chat.
+// Body: { sessionId: "..." }  + X-Agent-Secret header
+app.post('/message/read', requireAgentAuth, async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId mangler' });
+
+  const now = new Date().toISOString();
+  const { error } = await supabase
+    .from('messages')
+    .update({ read_at: now })
+    .eq('session_id', sessionId)
+    .eq('role', 'customer')
+    .is('read_at', null);
+
+  if (error) return res.status(500).json({ error: 'Kunne ikke opdatere læsestatus' });
+
+  // Broadcast "read"-event til widget via SSE
+  sseBroadcast(sessionId, 'read', { session_id: sessionId, read_at: now });
+  res.json({ ok: true, read_at: now });
+});
+
+// ── FEATURE 1: POST /session/reopen – genåbn en lukket session ────────────────
+// Body: { sessionId, name, email }  (ingen auth kræves – kunden genidentificerer sig)
+app.post('/session/reopen',
   rateLimit(5, 60_000),
   async (req, res) => {
-    const name    = sanitizeText(req.body.name    || '', 100);
-    const email   = sanitizeText(req.body.email   || '', 200);
-    const phone   = sanitizeText(req.body.phone   || '', 30) || null;
-    const message = sanitizeText(req.body.message || '', 2000);
-    const lang    = sanitizeLang(req.body.lang);
+    const sessionId = sanitizeText(req.body.sessionId || '', 40);
+    const name  = sanitizeText(req.body.name  || '', 100);
+    const email = sanitizeText(req.body.email || '', 200);
+    if (!sessionId) return res.status(400).json({ error: 'sessionId mangler' });
 
-    if (!name)    return res.status(400).json({ error: 'Navn er påkrævet' });
-    if (!email)   return res.status(400).json({ error: 'E-mail er påkrævet' });
-    if (!message) return res.status(400).json({ error: 'Besked er påkrævet' });
+    const { data: session, error: sessErr } = await supabase
+      .from('sessions').select('*').eq('id', sessionId).single();
+    if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
 
-    const { error: dbErr } = await supabase
-      .from('offline_messages')
-      .insert({ name, email, phone, message, lang });
-    if (dbErr) console.error('[offline/message] db error:', dbErr);
+    // Simpel identitetscheck: email skal matche det originale
+    if (session.email && email && session.email.toLowerCase() !== email.toLowerCase()) {
+      return res.status(403).json({ error: 'Identifikation mislykkedes' });
+    }
+
+    const newToken = makeToken(); // FEATURE 4: nyt token ved genåbning
+    const { error: updateErr } = await supabase.from('sessions').update({
+      status: 'open',
+      token: newToken,
+      reopened_count: (session.reopened_count || 0) + 1,
+    }).eq('id', sessionId);
+    if (updateErr) return res.status(500).json({ error: 'Kunne ikke genåbne session' });
 
     await postToTeams(adaptiveCard([
-      { type: 'TextBlock', text: `📩 Offline besked modtaget`, size: 'Medium', weight: 'Bolder', color: 'Warning' },
+      { type: 'TextBlock', text: `🔄 Chat genåbnet`, size: 'Medium', weight: 'Bolder', color: 'Warning' },
       { type: 'FactSet', facts: [
-        { title: 'Navn',    value: name },
-        { title: 'Email',   value: email },
-        { title: 'Telefon', value: phone || '—' },
-        { title: 'Sprog',   value: lang.toUpperCase() },
-        { title: 'Besked',  value: message },
+        { title: 'Kunde',   value: session.name },
+        { title: 'Session', value: makeShort(sessionId) },
+        { title: 'Genåbnet', value: String((session.reopened_count || 0) + 1) + '. gang' },
       ]},
     ]));
 
-    res.json({ saved: true });
+    // Hent eksisterende beskeder
+    const { data: messages } = await supabase
+      .from('messages').select('*').eq('session_id', sessionId).order('id');
+
+    res.json({ session: { ...session, status: 'open', token: newToken }, messages: messages || [] });
   }
 );
 
+// ── FEATURE 3: GET /translate – manuel oversættelse af en enkelt besked ───────
+// Query: ?text=...&from=da&to=en   (ingen auth – offentlig endpoint)
+app.get('/translate', rateLimit(60, 60_000), async (req, res) => {
+  const text   = sanitizeText(req.query.text || '', 2000);
+  const from   = sanitizeLang(req.query.from || 'da');
+  const to     = sanitizeLang(req.query.to   || 'en');
+  if (!text) return res.status(400).json({ error: 'text parameter mangler' });
+
+  const translated = await translateText(text, from, to);
+  res.json({ original: text, translated, from, to });
+});
+
 // ── POST /webhook/teams ───────────────────────────────────────────────────────
+// FEATURE 4: understøtter nu både simpel secret-header OG HMAC-signatur
 app.post('/webhook/teams', async (req, res) => {
-  const secret = req.headers['x-webhook-secret'] || '';
-  if (secret !== CONFIG.webhookSecret) return res.status(401).json({ error: 'Uautoriseret' });
+  const secret   = req.headers['x-webhook-secret'] || '';
+  const hmacSig  = req.headers['x-webhook-signature'] || '';
+  const rawBody  = req.rawBody || '';
+
+  const validSecret = secret === CONFIG.webhookSecret;
+  const validHmac   = hmacSig ? verifyHmac(CONFIG.webhookSecret, rawBody, hmacSig) : false;
+
+  if (!validSecret && !validHmac) return res.status(401).json({ error: 'Uautoriseret' });
 
   const raw    = sanitizeText(req.body.text || '', 2000);
   const parsed = parseAgentReply(raw);
@@ -430,10 +501,17 @@ app.post('/webhook/teams', async (req, res) => {
   const { data: msg, error } = await supabase
     .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer })
     .select().single();
-  if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
+  if (error) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
   clearReminder(session.id);
   sseBroadcast(session.id, 'message', msg);
+
+  // FEATURE 2: markér eksisterende kundes beskeder som læst (agenten har svaret)
+  await supabase.from('messages')
+    .update({ read_at: new Date().toISOString() })
+    .eq('session_id', session.id).eq('role', 'customer').is('read_at', null);
+  sseBroadcast(session.id, 'read', { session_id: session.id, read_at: new Date().toISOString() });
+
   res.json({ saved: true, message: msg });
 });
 
@@ -443,7 +521,7 @@ app.post('/session/close', async (req, res) => {
   if (!sessionId) return res.status(400).json({ error: 'X-Session-Id header mangler' });
 
   const { data: session } = await supabase.from('sessions').select('name').eq('id', sessionId).single();
-  await supabase.from('sessions').update({ status: 'closed' }).eq('id', sessionId);
+  await supabase.from('sessions').update({ status: 'closed', token: null }).eq('id', sessionId); // token invalideres
   clearReminder(sessionId);
 
   if (session) {
@@ -477,7 +555,7 @@ app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
 });
 
 app.post('/agent/reply', requireAgentAuth, async (req, res) => {
-  const { sessionId, message, agentName } = req.body;
+  const { sessionId, message } = req.body;
   if (!sessionId || !message) return res.status(400).json({ error: 'sessionId og message kræves' });
 
   const { data: session, error: sessErr } = await supabase
@@ -486,44 +564,35 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
   const textForCustomer = await translateToCustomerLang(sanitizeText(message, 2000), session.lang || 'da');
-  const safeAgentName   = sanitizeText(agentName || 'Agent', 80);
 
   const { data: msg, error: msgErr } = await supabase
-    .from('messages')
-    .insert({ session_id: sessionId, role: 'agent', text: textForCustomer, agent_name: safeAgentName })
+    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
     .select().single();
   if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
   clearReminder(sessionId);
-  sseBroadcast(session.id, 'message', msg);
+  sseBroadcast(sessionId, 'message', msg);
+
+  // FEATURE 2: markér kundes beskeder som læst
+  const now = new Date().toISOString();
+  await supabase.from('messages')
+    .update({ read_at: now })
+    .eq('session_id', sessionId).eq('role', 'customer').is('read_at', null);
+  sseBroadcast(sessionId, 'read', { session_id: sessionId, read_at: now });
+
   res.json({ message: msg });
 });
 
 // ── GET /health ───────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'login.html'));
-});
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'login.html')));
 
-// ─── Start (lokal) / Vercel export ───────────────────────────────────────────
-// RETTET: app.listen() må ikke kaldes på Vercel – kun lokalt.
-// module.exports skal stå UDEN app.listen() for at Vercel virker.
-if (require.main === module) {
-  // Køres direkte med `node index-autolock.js` – lokal udvikling
-  const port = CONFIG.port;
-  app.listen(port, () => {
-    console.log(`✅ Livechat server kører på port ${port}`);
-    console.log(`   Tilladte origins: ${CONFIG.allowedOrigins.join(', ')}`);
-    console.log(`   Teams webhook sat: ${CONFIG.teamsWebhookUrl ? 'ja' : '⚠️  mangler TEAMS_WEBHOOK_URL'}`);
-  });
-} else {
-  // Importeret af Vercel – kun log, ingen listen()
-  console.log(`✅ Kører som Vercel serverless function`);
+// ─── Start ────────────────────────────────────────────────────────────────────
+const port = CONFIG.port;
+app.listen(port, () => {
+  console.log(`✅ Livechat server kører på port ${port}`);
   console.log(`   Tilladte origins: ${CONFIG.allowedOrigins.join(', ')}`);
-  console.log(`   Teams webhook sat: ${CONFIG.teamsWebhookUrl ? 'ja' : '⚠️  mangler TEAMS_WEBHOOK_URL'}`);
-}
+});
 
 module.exports = app;
