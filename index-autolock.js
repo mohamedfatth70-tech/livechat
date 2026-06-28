@@ -1,738 +1,497 @@
-<!DOCTYPE html>
-<html lang="da">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AutoLock — Live Chat Dashboard</title>
-<style>
-  :root {
-    --red:       #c0392b;
-    --red-dark:  #a93226;
-    --red-soft:  #e74c3c;
-    --bg:        #140e0e;
-    --bg2:       #1a1010;
-    --bg3:       #221515;
-    --bg4:       #2a1a1a;
-    --border:    #3a1f1f;
-    --border2:   #4a2828;
-    --text:      #f0dede;
-    --text-dim:  #a07070;
-    --text-mute: #6b4040;
+/**
+ * AutoLock Livechat – Vercel + Supabase
+ *
+ * Ændringer fra original:
+ *  - In-memory Map() erstattet med Supabase (PostgreSQL)
+ *  - Long-polling erstattet med Server-Sent Events (SSE)
+ *  - Rate limiting på /session/start og /message/send
+ *  - Auth-middleware på agent-endpoints (/sessions, /messages, /agent/reply)
+ *  - CORS begrænset til kendte domæner via ALLOWED_ORIGINS env-variabel
+ *  - Input-validering og maks-længder på alle endpoints
+ *  - Webhook-secret valideres altid (ingen usikker fallback)
+ *
+ * Supabase tabeller (kør i Supabase SQL editor):
+ * ─────────────────────────────────────────────
+ * CREATE TABLE sessions (
+ *   id          TEXT PRIMARY KEY,
+ *   name        TEXT NOT NULL,
+ *   email       TEXT,
+ *   phone       TEXT,
+ *   lang        TEXT DEFAULT 'da',
+ *   status      TEXT DEFAULT 'open',
+ *   created_at  TIMESTAMPTZ DEFAULT now()
+ * );
+ *
+ * CREATE TABLE messages (
+ *   id             BIGSERIAL PRIMARY KEY,
+ *   session_id     TEXT REFERENCES sessions(id),
+ *   role           TEXT NOT NULL,  -- 'customer' eller 'agent'
+ *   text           TEXT NOT NULL,  -- det modtageren ser (kundens originale tekst, ELLER agentens tekst oversat til kundens sprog)
+ *   original_text  TEXT,           -- kun for role='agent': agentens originale danske tekst, til visning i agent-panelet
+ *   created_at     TIMESTAMPTZ DEFAULT now()
+ * );
+ *
+ * -- Hvis tabellen allerede findes, tilføj kolonnen med:
+ * -- ALTER TABLE messages ADD COLUMN original_text TEXT;
+ *
+ * CREATE INDEX ON messages(session_id, id);
+ * ─────────────────────────────────────────────
+ *
+ * Miljøvariabler (sæt i Vercel dashboard):
+ *   SUPABASE_URL          – Fra Supabase → Project Settings → API
+ *   SUPABASE_SERVICE_KEY  – Fra Supabase → Project Settings → API (service_role nøgle)
+ *   WEBHOOK_SECRET        – Hemmeligt token delt med Power Automate
+ *   AGENT_SECRET          – Hemmeligt token til agent-dashboard (sæt samme i agent-dashboard HTML)
+ *   TEAMS_WEBHOOK_URL     – Power Automate webhook URL
+ *   ALLOWED_ORIGINS       – Kommasepareret: https://autolock.dk,https://autolock.se,...
+ */
+
+'use strict';
+
+const express  = require('express');
+const https    = require('https');
+const crypto   = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
+const path = require('path');
+
+// ─── Konfiguration ────────────────────────────────────────────────────────────
+
+const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WEBHOOK_SECRET', 'AGENT_SECRET'];
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`[boot] FEJL: Miljøvariabel '${key}' mangler. Sæt den i Vercel dashboard.`);
+    process.exit(1);
   }
+}
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    height: 100vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
+const CONFIG = {
+  port:            process.env.PORT || 3001,
+  teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL || '',
+  webhookSecret:   process.env.WEBHOOK_SECRET,
+  agentSecret:     process.env.AGENT_SECRET,
+  replyTrigger:    '!svar',
+  allowedOrigins:  (process.env.ALLOWED_ORIGINS || 'http://localhost:3001')
+                     .split(',').map(s => s.trim()).filter(Boolean),
+};
+
+// ─── Supabase ─────────────────────────────────────────────────────────────────
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+// ─── SSE: aktive lyttere pr. session ──────────────────────────────────────────
+// Map<sessionId, Set<res>>
+const sseClients = new Map();
+
+function sseSubscribe(sessionId, res) {
+  if (!sseClients.has(sessionId)) sseClients.set(sessionId, new Set());
+  sseClients.get(sessionId).add(res);
+}
+
+function sseUnsubscribe(sessionId, res) {
+  const set = sseClients.get(sessionId);
+  if (set) { set.delete(res); if (set.size === 0) sseClients.delete(sessionId); }
+}
+
+function sseBroadcast(sessionId, event, data) {
+  const set = sseClients.get(sessionId);
+  if (!set || set.size === 0) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of set) {
+    try { res.write(payload); } catch (_) { sseUnsubscribe(sessionId, res); }
   }
+}
 
-  #topbar {
-    background: var(--bg2);
-    border-bottom: 1px solid var(--border);
-    padding: 0 20px;
-    height: 54px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-shrink: 0;
-  }
-  #topbar .brand { display: flex; align-items: center; gap: 10px; }
-  #topbar .brand-icon {
-    width: 32px; height: 32px;
-    background: linear-gradient(135deg, var(--red-dark), var(--red-soft));
-    border-radius: 6px;
-    display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 2px 8px rgba(192,57,43,0.4);
-  }
-  #topbar .brand-icon svg { width: 18px; height: 18px; fill: #fff; }
-  #topbar .brand-name { font-size: 15px; font-weight: 700; color: #fff; letter-spacing: -0.01em; }
-  #topbar .brand-sub { font-size: 12px; color: var(--text-mute); margin-left: 4px; }
-  #topbar .status { font-size: 12px; color: var(--text-mute); display: flex; align-items: center; gap: 6px; }
-  #topbar .dot { width: 8px; height: 8px; border-radius: 50%; background: #6effa0; box-shadow: 0 0 6px #6effa0; animation: pulse 2s infinite; }
-  #topbar .dot.offline { background: #fc8181; box-shadow: 0 0 6px #fc8181; animation: none; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+// ─── Rate limiting (in-memory, nulstilles ved server-genstart) ────────────────
+// På Vercel er dette per-instans – tilstrækkelig til at afbøde burst-angreb.
+// For produktions-grade rate limiting: brug Upstash Redis eller Vercel Edge Middleware.
 
+const rateLimitStore = new Map(); // ip → { count, resetAt }
 
-  #main { display: flex; flex: 1; min-height: 0; }
-
-  #sidebar {
-    width: 268px;
-    background: var(--bg2);
-    border-right: 1px solid var(--border);
-    display: flex; flex-direction: column;
-    flex-shrink: 0;
-  }
-  #sidebar-header {
-    padding: 12px 14px;
-    border-bottom: 1px solid var(--border);
-    font-size: 11px; font-weight: 700;
-    color: var(--text-mute); text-transform: uppercase;
-    letter-spacing: 0.06em;
-    display: flex; align-items: center; justify-content: space-between;
-    flex-shrink: 0;
-  }
-  #session-count {
-    background: linear-gradient(135deg, var(--red), var(--red-soft));
-    color: #fff;
-    border-radius: 10px; padding: 1px 7px;
-    font-size: 11px; font-weight: 700;
-    box-shadow: 0 1px 6px rgba(192,57,43,0.4);
-  }
-  #session-list { flex: 1; overflow-y: auto; }
-  #session-list::-webkit-scrollbar { width: 4px; }
-  #session-list::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
-
-  .session-item {
-    padding: 12px 14px;
-    border-bottom: 1px solid var(--border);
-    cursor: pointer;
-    display: flex; align-items: center; gap: 10px;
-    transition: background 0.1s;
-    border-left: 3px solid transparent;
-  }
-  .session-item:hover { background: var(--bg3); }
-  .session-item.active { background: #2a1010; border-left-color: var(--red-soft); }
-  .session-item .avatar {
-    width: 36px; height: 36px; border-radius: 50%;
-    background: linear-gradient(135deg, var(--red-dark), var(--red-soft));
-    color: #fff;
-    font-size: 13px; font-weight: 700;
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0;
-    box-shadow: 0 2px 6px rgba(192,57,43,0.35);
-  }
-  .session-item .info { flex: 1; min-width: 0; }
-  .session-item .s-name { font-size: 13.5px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .session-item .s-preview { font-size: 12px; color: var(--text-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
-  .session-item .unread { width: 8px; height: 8px; border-radius: 50%; background: var(--red-soft); flex-shrink: 0; box-shadow: 0 0 6px var(--red-soft); }
-
-  #empty-state {
-    padding: 40px 20px; text-align: center;
-    color: var(--text-mute); font-size: 13px; line-height: 1.7;
-  }
-
-  #chat-panel {
-    flex: 1; display: flex; flex-direction: column;
-    min-width: 0; background: var(--bg);
-  }
-  #chat-header {
-    background: var(--bg2);
-    border-bottom: 1px solid var(--border);
-    padding: 12px 20px;
-    display: flex; align-items: center;
-    justify-content: space-between;
-    flex-shrink: 0; min-height: 56px;
-  }
-  #chat-name { font-size: 15px; font-weight: 700; color: #fff; }
-  #chat-meta { font-size: 12px; color: var(--text-mute); margin-top: 2px; }
-  #close-session-btn {
-    padding: 6px 14px;
-    background: #1a0505; color: #fc8181;
-    border: 1px solid var(--red-dark); border-radius: 6px;
-    font-size: 12px; cursor: pointer; font-weight: 600;
-    transition: background 0.15s; display: none;
-  }
-  #close-session-btn:hover { background: #2a0a0a; }
-
-  #messages {
-    flex: 1; overflow-y: auto;
-    padding: 16px 20px;
-    display: none; flex-direction: column; gap: 8px;
-    min-height: 0;
-  }
-  #messages::-webkit-scrollbar { width: 4px; }
-  #messages::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
-
-  .msg-wrap { display: flex; flex-direction: column; }
-  .msg { max-width: 72%; padding: 9px 13px; border-radius: 12px; font-size: 13.5px; line-height: 1.5; word-break: break-word; }
-  .msg-label { font-size: 11px; color: var(--text-mute); margin-bottom: 3px; padding: 0 2px; }
-  .msg-label.right { text-align: right; }
-  .msg-customer { align-self: flex-start; background: var(--bg3); color: var(--text); border: 1px solid var(--border2); border-bottom-left-radius: 3px; }
-  .msg-agent { align-self: flex-end; background: linear-gradient(135deg, var(--red) 0%, var(--red-soft) 100%); color: #fff; font-weight: 500; border-bottom-right-radius: 3px; box-shadow: 0 2px 8px rgba(192,57,43,0.35); }
-  .msg-system { align-self: center; font-size: 11.5px; color: var(--text-mute); padding: 2px 0; }
-
-  .msg-translate-btn {
-    align-self: flex-start;
-    margin-top: 3px; padding: 1px 0;
-    font-size: 11px; color: var(--text-mute);
-    background: none; border: none; cursor: pointer;
-    text-decoration: underline; transition: color 0.15s;
-  }
-  .msg-translate-btn:hover { color: var(--red-soft); }
-  .msg-translate-btn:disabled { cursor: default; text-decoration: none; opacity: 0.6; }
-  .msg-translation {
-    align-self: flex-start;
-    max-width: 72%;
-    font-size: 12px; color: var(--text-dim);
-    font-style: italic;
-    margin-top: 2px; padding: 0 2px;
-    line-height: 1.4;
-  }
-
-  #no-chat {
-    flex: 1; display: flex; align-items: center;
-    justify-content: center; flex-direction: column;
-    gap: 12px; color: var(--text-mute); font-size: 14px;
-  }
-  #no-chat svg { width: 48px; height: 48px; fill: var(--border2); }
-
-  #input-bar {
-    background: var(--bg2);
-    border-top: 1px solid var(--border);
-    padding: 12px 16px;
-    display: none; gap: 10px; align-items: flex-end;
-    flex-shrink: 0;
-  }
-  #agent-input {
-    flex: 1; padding: 9px 13px;
-    border: 1px solid var(--border2); border-radius: 12px;
-    font-size: 14px; outline: none;
-    background: var(--bg3); color: var(--text);
-    resize: none; line-height: 1.5;
-    max-height: 100px; overflow-y: auto;
-    font-family: inherit;
-    transition: border-color 0.15s, box-shadow 0.15s;
-    min-height: 40px;
-  }
-  #agent-input:focus { border-color: var(--red-soft); box-shadow: 0 0 0 3px rgba(231,76,60,0.12); }
-  #agent-input::placeholder { color: var(--text-mute); }
-  #send-btn {
-    width: 40px; height: 40px; border-radius: 50%;
-    background: linear-gradient(135deg, var(--red), var(--red-soft));
-    border: none; cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0; transition: opacity 0.15s, transform 0.1s;
-    box-shadow: 0 2px 8px rgba(192,57,43,0.4);
-  }
-  #send-btn:hover { opacity: 0.88; transform: scale(1.05); }
-  #send-btn:disabled { background: var(--border2); box-shadow: none; cursor: not-allowed; transform: none; opacity: 0.5; }
-  #send-btn svg { width: 16px; height: 16px; fill: #fff; }
-
-  #toast {
-    position: fixed; top: 16px; right: 16px;
-    background: linear-gradient(135deg, var(--red), var(--red-soft));
-    color: #fff;
-    padding: 10px 16px; border-radius: 8px;
-    font-size: 13px; font-weight: 600;
-    opacity: 0; pointer-events: none;
-    transition: opacity 0.2s; z-index: 999;
-    max-width: 280px;
-    box-shadow: 0 4px 16px rgba(192,57,43,0.45);
-  }
-  #toast.show { opacity: 1; }
-</style>
-</head>
-<body>
-
-<div id="toast"></div>
-
-<div id="topbar">
-  <div class="brand">
-    <div class="brand-icon" aria-hidden="true">
-      <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
-    </div>
-    <span class="brand-name">AutoLock</span>
-    <span class="brand-sub">Live Chat Dashboard</span>
-  </div>
-  <div class="status">
-    <span class="dot offline" id="status-dot"></span>
-    <span id="status-text">Forbinder...</span>
-    <span id="agent-name-badge" style="margin-left:10px;padding:2px 9px;background:rgba(192,57,43,0.18);border:1px solid var(--border2);border-radius:10px;font-size:11px;color:var(--text-dim);font-weight:600;letter-spacing:0.04em;"></span>
-  </div>
-</div>
-
-
-<div id="main">
-  <div id="sidebar">
-    <div id="sidebar-header">
-      Aktive chats
-      <span id="session-count">0</span>
-    </div>
-    <div id="session-list">
-      <div id="empty-state">Ingen aktive chats.<br>Afventer kunder...</div>
-    </div>
-  </div>
-
-  <div id="chat-panel">
-    <div id="chat-header">
-      <div>
-        <div id="chat-name">Vælg en chat</div>
-        <div id="chat-meta"></div>
-      </div>
-      <button id="close-session-btn" onclick="closeSession()">Afslut chat</button>
-    </div>
-
-    <div id="no-chat">
-      <svg viewBox="0 0 24 24"><path d="M20 2H4C2.9 2 2 2.9 2 4v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 12H6l-2 2V4h16v10z"/></svg>
-      <p>Vælg en chat i venstre side</p>
-    </div>
-
-    <div id="messages"></div>
-
-    <div id="input-bar">
-      <textarea id="agent-input" rows="1" placeholder="Skriv svar til kunde..."></textarea>
-      <button id="send-btn" onclick="sendReply()" aria-label="Send">
-        <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-      </button>
-    </div>
-  </div>
-</div>
-
-<script>
-(function () {
-  var API_BASE = 'https://livechat-ecru-seven.vercel.app';
-  var AGENT_SECRET = 'p2nh7wqt5xm3rvkd8bjyfe6lcs4aguoz';
-  var sessions = {};          // id -> { id, name, email, phone, lang, status, messages: [], unread: 0 }
-  var activeSessionId = null;
-  // Hent agentens navn fra auth (AutoLockAuth eller MSAL)
-  var AGENT_NAME = (typeof AutoLockAuth !== 'undefined' && AutoLockAuth.getUsername && AutoLockAuth.getUsername()) || 'Agent';
-  var agentBadge = document.getElementById('agent-name-badge');
-  if (agentBadge) agentBadge.textContent = AGENT_NAME;
-  var pollTimer = null;
-  var isPolling = false;
-
-  // Sprognavne til visning i chat-meta (kode -> dansk visningsnavn)
-  var LANG_NAMES = {
-    da: 'Dansk', sv: 'Svensk', de: 'Tysk', en: 'Engelsk',
-    nb: 'Norsk', fi: 'Finsk', nl: 'Hollandsk', fr: 'Fransk',
-    es: 'Spansk', pl: 'Polsk'
+function rateLimit(maxRequests, windowMs) {
+  return (req, res, next) => {
+    const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+    const now = Date.now();
+    let entry = rateLimitStore.get(ip);
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 0, resetAt: now + windowMs };
+      rateLimitStore.set(ip, entry);
+    }
+    entry.count++;
+    if (entry.count > maxRequests) {
+      return res.status(429).json({ error: 'For mange forespørgsler – prøv igen om lidt' });
+    }
+    next();
   };
-  function langLabel(code) {
-    if (!code) return null;
-    var c = code.toLowerCase();
-    return (LANG_NAMES[c] || c.toUpperCase()) + ' (' + c.toUpperCase() + ')';
+}
+
+// ─── Auth-middleware til agent-endpoints ──────────────────────────────────────
+
+function requireAgentAuth(req, res, next) {
+  const token = req.headers['x-agent-secret'] || req.query.agent_secret;
+  if (!token || token !== CONFIG.agentSecret) {
+    return res.status(401).json({ error: 'Uautoriseret' });
   }
+  next();
+}
 
-  var sessionList  = document.getElementById('session-list');
-  var emptyState   = document.getElementById('empty-state');
-  var sessionCount = document.getElementById('session-count');
-  var chatNameEl   = document.getElementById('chat-name');
-  var chatMetaEl   = document.getElementById('chat-meta');
-  var messagesEl   = document.getElementById('messages');
-  var noChatEl     = document.getElementById('no-chat');
-  var inputBar     = document.getElementById('input-bar');
-  var agentInput   = document.getElementById('agent-input');
-  var sendBtn      = document.getElementById('send-btn');
-  var closeBtn     = document.getElementById('close-session-btn');
-  var statusDot    = document.getElementById('status-dot');
-  var statusText   = document.getElementById('status-text');
-  var toastEl      = document.getElementById('toast');
+// ─── Hjælpefunktioner ─────────────────────────────────────────────────────────
 
-  requestNotifPermission();
-  startPolling();
+function makeId()      { return crypto.randomBytes(16).toString('hex'); }
+function makeShort(id) { return id.slice(0, 8); }
 
-  function requestNotifPermission() {
-    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-      Notification.requestPermission();
-    }
-  }
+const VALID_LANGS = ['da', 'sv', 'de', 'en', 'nb', 'fi', 'nl', 'fr', 'es', 'pl'];
+function sanitizeLang(lang) {
+  const l = (lang || 'da').toLowerCase().slice(0, 5);
+  return VALID_LANGS.includes(l) ? l : 'da';
+}
 
-  function setStatus(online) {
-    statusDot.className = 'dot' + (online ? '' : ' offline');
-    statusText.textContent = online ? 'Online' : 'Ingen forbindelse';
-  }
+function sanitizeText(str, maxLen = 2000) {
+  if (typeof str !== 'string') return '';
+  return str.trim().slice(0, maxLen);
+}
 
-  var toastTimer = null;
-  function showToast(msg) {
-    toastEl.textContent = msg;
-    toastEl.classList.add('show');
-    if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(function() { toastEl.classList.remove('show'); }, 3500);
-  }
+// ─── Oversættelse via MyMemory ────────────────────────────────────────────────
 
-  function startPolling() {
-    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-    isPolling = false;
-    poll();
-  }
-
-  function poll() {
-    if (isPolling || !API_BASE) return;
-    isPolling = true;
-    fetch(API_BASE + '/health')
-      .then(function(r) { return r.json(); })
-      .then(function() {
-        setStatus(true);
-        return fetchSessions();
-      })
-      .catch(function() {
-        setStatus(false);
-        isPolling = false;
-        pollTimer = setTimeout(poll, 4000);
-      });
-  }
-
-  function fetchSessions() {
-    return fetch(API_BASE + '/sessions', { headers: { 'X-Agent-Secret': AGENT_SECRET } })
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        var list = data.sessions || [];
-        handleSessionList(list);
-        var fetchPromise = activeSessionId
-          ? fetchMessages(activeSessionId)
-          : Promise.resolve();
-        return fetchPromise;
-      })
-      .then(function() {
-        isPolling = false;
-        pollTimer = setTimeout(poll, 1500);
-      })
-      .catch(function() {
-        isPolling = false;
-        pollTimer = setTimeout(poll, 4000);
-      });
-  }
-
-  function handleSessionList(list) {
-    var open = list.filter(function(s) { return s.status === 'open'; });
-
-    // Detect new sessions
-    open.forEach(function(s) {
-      if (!sessions[s.id]) {
-        sessions[s.id] = Object.assign({}, s, { messages: [], unread: 0 });
-        showToast('Ny kunde: ' + s.name);
-        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-          new Notification('AutoLock Chat', { body: s.name + ' har startet en chat' });
-        }
-      } else {
-        // Update metadata but preserve messages/unread
-        sessions[s.id].name   = s.name;
-        sessions[s.id].email  = s.email;
-        sessions[s.id].phone  = s.phone;
-        sessions[s.id].lang   = s.lang;
-        sessions[s.id].status = s.status;
-      }
-    });
-
-    // Mark sessions as closed if they're no longer open (but keep them in sidebar)
-    Object.keys(sessions).forEach(function(id) {
-      var stillOpen = open.some(function(s) { return s.id === id; });
-      if (!stillOpen && sessions[id].status === 'open') {
-        sessions[id].status = 'closed';
-        // If this is the active session, update UI to show it's closed
-        if (activeSessionId === id) {
-          closeBtn.style.display = 'none';
-          inputBar.style.display = 'none';
-          chatMetaEl.textContent = chatMetaEl.textContent.replace(/^/, '🔴 Lukket · ');
-          var closedMsg = document.createElement('div');
-          closedMsg.className = 'msg-wrap';
-          var sys = document.createElement('div');
-          sys.className = 'msg msg-system';
-          sys.textContent = 'Kunden afsluttede chatten';
-          closedMsg.appendChild(sys);
-          messagesEl.appendChild(closedMsg);
-          scrollMessages();
-        }
-      }
-    });
-
-    // Add any new open sessions
-    var allVisible = Object.values(sessions);
-    sessionCount.textContent = open.length;
-    renderSessionList(allVisible);
-  }
-
-  function renderSessionList(list) {
-    var open = list.filter(function(s) { return s.status === 'open'; });
-    var closed = list.filter(function(s) { return s.status !== 'open'; });
-    var sorted = open.concat(closed);
-
-    if (sorted.length === 0) {
-      sessionList.innerHTML = '';
-      sessionList.appendChild(emptyState);
-      return;
-    }
-    sessionList.innerHTML = '';
-    sorted.forEach(function(s) {
-      var sd = sessions[s.id];
-      var msgs = sd ? sd.messages : [];
-      var last = msgs.length ? msgs[msgs.length - 1] : null;
-      var preview = last ? last.text : 'Chat startet';
-      var hasUnread = sd && sd.unread > 0;
-      var isClosed = s.status !== 'open';
-      var initials = s.name.split(' ').map(function(w) { return w[0]; }).join('').toUpperCase().slice(0, 2);
-
-      var div = document.createElement('div');
-      div.className = 'session-item' + (s.id === activeSessionId ? ' active' : '');
-      if (isClosed) div.style.opacity = '0.55';
-      div.innerHTML =
-        '<div class="avatar" style="' + (isClosed ? 'background:var(--border2);box-shadow:none;' : '') + '">' + esc(initials) + '</div>' +
-        '<div class="info">' +
-          '<div class="s-name">' + esc(s.name) + (isClosed ? ' <span style="font-size:10px;color:var(--text-mute);font-weight:400;">(lukket)</span>' : '') + '</div>' +
-          '<div class="s-preview">' + esc(preview.slice(0, 50)) + '</div>' +
-        '</div>' +
-        (hasUnread ? '<div class="unread"></div>' : '');
-
-      if (!isClosed) {
-        div.addEventListener('click', function() { selectSession(s.id); });
-      } else {
-        // Closed sessions: clickable to view, but show a "Fjern" button
-        div.style.cursor = 'pointer';
-        var removeBtn = document.createElement('button');
-        removeBtn.textContent = '✕';
-        removeBtn.title = 'Fjern fra liste';
-        removeBtn.style.cssText = 'background:none;border:none;color:var(--text-mute);cursor:pointer;font-size:14px;padding:4px 6px;border-radius:4px;flex-shrink:0;';
-        removeBtn.addEventListener('mouseenter', function() { this.style.color = '#fc8181'; });
-        removeBtn.addEventListener('mouseleave', function() { this.style.color = 'var(--text-mute)'; });
-        removeBtn.addEventListener('click', function(e) {
-          e.stopPropagation();
-          delete sessions[s.id];
-          if (activeSessionId === s.id) {
-            activeSessionId = null;
-            chatNameEl.textContent = 'Vælg en chat';
-            chatMetaEl.textContent = '';
-            messagesEl.style.display = 'none';
-            messagesEl.innerHTML = '';
-            noChatEl.style.display = 'flex';
-            inputBar.style.display = 'none';
-            closeBtn.style.display = 'none';
-          }
-          renderSessionList(Object.values(sessions));
-          sessionCount.textContent = Object.values(sessions).filter(function(sd) { return sd.status === 'open'; }).length;
-        });
-        div.addEventListener('click', function() { selectSession(s.id); });
-        div.appendChild(removeBtn);
-      }
-
-      sessionList.appendChild(div);
-    });
-  }
-
-  function selectSession(id) {
-    if (!sessions[id]) return;
-    activeSessionId = id;
-    var s = sessions[id];
-    s.unread = 0;
-    var isClosed = s.status !== 'open';
-
-    chatNameEl.textContent = s.name || 'Kunde';
-    var meta = 'Session: ' + id.slice(0, 8);
-    if (s.email) meta += ' · ' + s.email;
-    if (s.phone) meta += ' · ' + s.phone;
-    var langText = langLabel(s.lang);
-    if (langText) meta += ' · ' + langText;
-    if (isClosed) meta = '🔴 Lukket · ' + meta;
-    chatMetaEl.textContent = meta;
-
-    messagesEl.style.display = 'flex';
-    noChatEl.style.display = 'none';
-    inputBar.style.display = isClosed ? 'none' : 'flex';
-    closeBtn.style.display = isClosed ? 'none' : 'block';
-
-    rebuildMessages(id);
-    agentInput.focus();
-
-    // Re-render sidebar to clear unread dot and set active state
-    renderSessionList(Object.values(sessions));
-
-    // Fetch latest messages immediately
-    fetchMessages(id);
-  }
-
-  function rebuildMessages(sessionId) {
-    var s = sessions[sessionId];
-    messagesEl.innerHTML = '';
-    if (!s) return;
-    s.messages.forEach(function(m) { appendMessageEl(m, s.name || 'Kunde'); });
-    scrollMessages();
-  }
-
-  function fetchMessages(sessionId) {
-    return fetch(API_BASE + '/messages/' + sessionId, { headers: { 'X-Agent-Secret': AGENT_SECRET } })
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        var msgs = data.messages || [];
-        var s = sessions[sessionId];
-        if (!s) return;
-
-        var knownIds = {};
-        s.messages.forEach(function(m) { knownIds[msgKey(m)] = true; });
-
-        var added = false;
-        msgs.forEach(function(m) {
-          var key = msgKey(m);
-          if (!knownIds[key]) {
-            knownIds[key] = true;
-            s.messages.push(m);
-            added = true;
-            if (m.role === 'customer' && sessionId !== activeSessionId) {
-              s.unread++;
-              showToast((s.name || 'Kunde') + ': ' + m.text.slice(0, 60));
-            }
-          }
-        });
-
-        if (added && sessionId === activeSessionId) {
-          rebuildMessages(sessionId);
-        }
-        if (added) {
-          renderSessionList(Object.values(sessions));
-        }
-      })
-      .catch(function() {});
-  }
-
-  function msgKey(m) {
-    return (m.id || '') + '|' + (m.role || '') + '|' + (m.text || '').slice(0, 40);
-  }
-
-  function appendMessageEl(msg, customerName) {
-    var wrap = document.createElement('div');
-    wrap.className = 'msg-wrap';
-
-    if (msg.role === 'system') {
-      var sys = document.createElement('div');
-      sys.className = 'msg msg-system';
-      sys.textContent = msg.text;
-      wrap.appendChild(sys);
-    } else {
-      var label = document.createElement('div');
-      label.className = 'msg-label' + (msg.role === 'agent' ? ' right' : '');
-      label.textContent = msg.role === 'agent' ? (msg.agentName || AGENT_NAME) : (customerName || 'Kunde');
-
-      var div = document.createElement('div');
-      div.className = 'msg msg-' + msg.role;
-      // Agent-beskeder vises på dansk (original_text) i panelet, selvom det
-      // der faktisk blev sendt til kunden er oversat (msg.text).
-      div.textContent = (msg.role === 'agent' && msg.original_text) ? msg.original_text : msg.text;
-
-      wrap.appendChild(label);
-      wrap.appendChild(div);
-
-      // Manuel oversæt-knap for kundebeskeder
-      if (msg.role === 'customer') {
-        var transBtn = document.createElement('button');
-        transBtn.className = 'msg-translate-btn';
-        transBtn.textContent = 'Oversæt';
-        transBtn.addEventListener('click', function() {
-          translateCustomerMessage(msg.text, transBtn);
-        });
-        wrap.appendChild(transBtn);
-      }
-    }
-
-    messagesEl.appendChild(wrap);
-  }
-
-  function translateCustomerMessage(text, btnEl) {
-    btnEl.disabled = true;
-    btnEl.textContent = 'Oversætter...';
-    fetch(API_BASE + '/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
-      body: JSON.stringify({ text: text })
-    })
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        if (data.translated) {
-          var transEl = document.createElement('div');
-          transEl.className = 'msg-translation';
-          transEl.textContent = data.translated;
-          btnEl.parentNode.insertBefore(transEl, btnEl.nextSibling);
-          btnEl.remove();
-        } else {
-          btnEl.disabled = false;
-          btnEl.textContent = 'Oversæt';
-          showToast('Kunne ikke oversætte');
-        }
-      })
-      .catch(function() {
-        btnEl.disabled = false;
-        btnEl.textContent = 'Oversæt';
-        showToast('Kunne ikke oversætte');
-      });
-  }
-
-  function scrollMessages() {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
-
-  window.sendReply = function () {
-    var text = agentInput.value.trim();
-    if (!text || !activeSessionId) return;
-
-    agentInput.value = '';
-    agentInput.style.height = 'auto';
-    sendBtn.disabled = true;
-
-    fetch(API_BASE + '/agent/reply', { // requires agent auth
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
-      body: JSON.stringify({ sessionId: activeSessionId, message: text, agentName: AGENT_NAME })
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      sendBtn.disabled = false;
-      if (data.message) {
-        var s = sessions[activeSessionId];
-        if (s) {
-          // Berig med agentName og original_text hvis serveren ikke returnerer det
-          if (!data.message.agentName) data.message.agentName = AGENT_NAME;
-          if (!data.message.original_text) data.message.original_text = text;
-          var key = msgKey(data.message);
-          var already = s.messages.some(function(m) { return msgKey(m) === key; });
-          if (!already) {
-            s.messages.push(data.message);
-            appendMessageEl(data.message, s.name || 'Dig');
-            scrollMessages();
-          }
-        }
-      }
-    })
-    .catch(function() {
-      sendBtn.disabled = false;
-      showToast('Svar kunne ikke sendes');
-    });
-  };
-
-  window.closeSession = function () {
-    if (!activeSessionId) return;
-    var sid = activeSessionId;
-    fetch(API_BASE + '/session/close', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Session-Id': sid }
-    })
-    .then(function() {
-      delete sessions[sid];
-      activeSessionId = null;
-      chatNameEl.textContent = 'Vælg en chat';
-      chatMetaEl.textContent = '';
-      messagesEl.style.display = 'none';
-      messagesEl.innerHTML = '';
-      noChatEl.style.display = 'flex';
-      inputBar.style.display = 'none';
-      closeBtn.style.display = 'none';
-      renderSessionList(Object.values(sessions).filter(function(sd) { return sd.status === 'open'; }));
-    })
-    .catch(function() {
-      showToast('Kunne ikke afslutte session');
-    });
-  };
-
-  agentInput.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      window.sendReply();
-    }
+function httpGet(url) {
+  return new Promise((resolve) => {
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(data));
+    }).on('error', () => resolve(null));
   });
+}
 
-  agentInput.addEventListener('input', function() {
-    this.style.height = 'auto';
-    this.style.height = Math.min(this.scrollHeight, 100) + 'px';
+async function detectAndTranslateToDanish(text) {
+  if (!text?.trim()) return { translated: text, detectedLang: 'da' };
+  try {
+    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=autodetect|da`);
+    const json = JSON.parse(raw);
+    return {
+      translated:   json.responseData?.translatedText || text,
+      detectedLang: json.matches?.[0]?.source || 'da',
+    };
+  } catch { return { translated: text, detectedLang: 'da' }; }
+}
+
+async function translateToCustomerLang(text, targetLang) {
+  if (!text?.trim() || !targetLang || targetLang === 'da') return text;
+  try {
+    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${targetLang}`);
+    const json = JSON.parse(raw);
+    return json.responseData?.translatedText || text;
+  } catch { return text; }
+}
+
+// ─── Teams webhook ────────────────────────────────────────────────────────────
+
+function postToTeams(payload) {
+  if (!CONFIG.teamsWebhookUrl) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const url  = new URL(CONFIG.teamsWebhookUrl);
+    const req  = https.request({
+      hostname: url.hostname, port: url.port || 443,
+      path: url.pathname + url.search, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, res => { res.resume(); resolve(res.statusCode >= 200 && res.statusCode < 300); });
+    req.on('error', () => resolve(false));
+    req.setTimeout(10000, () => { req.destroy(); resolve(false); });
+    req.write(body); req.end();
   });
+}
 
-  function esc(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+function adaptiveCard(bodyBlocks) {
+  return {
+    type: 'message',
+    attachments: [{
+      contentType: 'application/vnd.microsoft.card.adaptive',
+      content: {
+        $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+        type: 'AdaptiveCard', version: '1.4',
+        body: bodyBlocks,
+      },
+    }],
+  };
+}
+
+function sendToTeams(sessionId, customerName, message) {
+  const short = makeShort(sessionId);
+  return postToTeams(adaptiveCard([
+    { type: 'TextBlock', text: `💬 Ny besked fra kunde`, size: 'Medium', weight: 'Bolder', color: 'Accent' },
+    { type: 'FactSet', facts: [
+      { title: 'Kunde',   value: customerName },
+      { title: 'Session', value: short },
+      { title: 'Besked',  value: message },
+    ]},
+    { type: 'TextBlock', text: `**Svar:** \`${CONFIG.replyTrigger} ${short}: Dit svar\``, wrap: true, color: 'Good', spacing: 'Medium' },
+  ]));
+}
+
+function sendReminderToTeams(session) {
+  const short = makeShort(session.id);
+  return postToTeams(adaptiveCard([
+    { type: 'TextBlock', text: `⏰ Ubesvaret chat – ingen svar i over 1 minut`, size: 'Medium', weight: 'Bolder', color: 'Warning' },
+    { type: 'FactSet', facts: [
+      { title: 'Kunde',   value: session.name },
+      { title: 'Email',   value: session.email || '—' },
+      { title: 'Telefon', value: session.phone || '—' },
+      { title: 'Session', value: short },
+    ]},
+    { type: 'TextBlock', text: `**Svar:** \`${CONFIG.replyTrigger} ${short}: Dit svar\``, wrap: true, color: 'Good', spacing: 'Medium' },
+  ]));
+}
+
+// ─── Reminder-timers (in-memory er OK – de er ikke kritiske) ─────────────────
+
+const pendingReminders = new Map();
+
+function scheduleReminder(session) {
+  clearReminder(session.id);
+  const t = setTimeout(async () => {
+    pendingReminders.delete(session.id);
+    const { data } = await supabase.from('sessions').select('status').eq('id', session.id).single();
+    if (data?.status === 'open') await sendReminderToTeams(session);
+  }, 60_000);
+  pendingReminders.set(session.id, t);
+}
+
+function clearReminder(sessionId) {
+  const t = pendingReminders.get(sessionId);
+  if (t) { clearTimeout(t); pendingReminders.delete(sessionId); }
+}
+
+// ─── Parse agent-svar fra Teams ───────────────────────────────────────────────
+
+function parseAgentReply(raw) {
+  raw = raw.trim().replace(/<[^>]+>/g, '').replace(/&[a-z]+;/gi, ' ').trim();
+  if (!raw.toLowerCase().startsWith(CONFIG.replyTrigger.toLowerCase())) return null;
+  const rest     = raw.slice(CONFIG.replyTrigger.length).trim();
+  const colonIdx = rest.indexOf(':');
+  if (colonIdx === -1) return null;
+  const shortId = rest.slice(0, colonIdx).trim();
+  const message = rest.slice(colonIdx + 1).trim();
+  if (!shortId || !message) return null;
+  return { shortId, message };
+}
+
+// ─── Express app ──────────────────────────────────────────────────────────────
+
+const app = express();
+app.use(express.json({ limit: '32kb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// CORS – kun kendte origins
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && CONFIG.allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
   }
-})();
-</script>
-</body>
-</html>
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-Webhook-Secret, X-Agent-Secret');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ── POST /session/start ───────────────────────────────────────────────────────
+app.post('/session/start',
+  rateLimit(10, 60_000), // maks 10 nye sessioner/minut per IP
+  async (req, res) => {
+    const name  = sanitizeText(req.body.name  || 'Gæst', 100);
+    const email = sanitizeText(req.body.email || '', 200) || null;
+    const phone = sanitizeText(req.body.phone || '', 30)  || null;
+    const lang  = sanitizeLang(req.body.lang);
+    const id    = makeId();
+
+    const { error } = await supabase.from('sessions').insert({ id, name, email, phone, lang, status: 'open' });
+    if (error) { console.error('[session/start]', error); return res.status(500).json({ error: 'Kunne ikke oprette session' }); }
+
+    await postToTeams(adaptiveCard([
+      { type: 'TextBlock', text: `🟢 Ny chat-session åbnet`, size: 'Medium', weight: 'Bolder', color: 'Good' },
+      { type: 'FactSet', facts: [
+        { title: 'Kunde',   value: name },
+        { title: 'Email',   value: email || '—' },
+        { title: 'Telefon', value: phone || '—' },
+        { title: 'Sprog',   value: lang.toUpperCase() },
+        { title: 'Session', value: makeShort(id) },
+      ]},
+    ]));
+
+    res.json({ session: { id, name, email, phone, lang, status: 'open' } });
+  }
+);
+
+// ── POST /message/send ────────────────────────────────────────────────────────
+app.post('/message/send',
+  rateLimit(30, 60_000), // maks 30 beskeder/minut per IP
+  async (req, res) => {
+    const sessionId = req.headers['x-session-id'];
+    const text      = sanitizeText(req.body.message || '', 2000);
+
+    if (!sessionId) return res.status(400).json({ error: 'X-Session-Id header mangler' });
+    if (!text)      return res.status(400).json({ error: 'Besked må ikke være tom' });
+
+    const { data: session, error: sessErr } = await supabase
+      .from('sessions').select('*').eq('id', sessionId).single();
+    if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
+    if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
+
+    // Ingen auto-oversættelse her længere – kundens originale besked gemmes
+    // og vises som den er i agent-panelet. Sproget kommer fra session.lang,
+    // som widget'en satte ved session-start (browser-sprog).
+
+    const { data: msg, error: msgErr } = await supabase
+      .from('messages').insert({ session_id: sessionId, role: 'customer', text })
+      .select().single();
+    if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
+
+    scheduleReminder(session);
+    await sendToTeams(sessionId, session.name, text);
+
+    res.json({ message: msg });
+  }
+);
+
+// ── GET /message/sse – Server-Sent Events (erstatter long-poll) ───────────────
+// Widget lytter her efter agent-svar i realtid.
+app.get('/message/sse', (req, res) => {
+  const sessionId = req.headers['x-session-id'] || req.query.session_id;
+  if (!sessionId) return res.status(400).json({ error: 'session_id mangler' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  // Heartbeat hvert 25s for at holde forbindelsen i live
+  const hb = setInterval(() => { try { res.write(': heartbeat\n\n'); } catch (_) {} }, 25_000);
+
+  sseSubscribe(sessionId, res);
+  req.on('close', () => { clearInterval(hb); sseUnsubscribe(sessionId, res); });
+});
+
+// ── POST /webhook/teams ───────────────────────────────────────────────────────
+app.post('/webhook/teams', async (req, res) => {
+  const secret = req.headers['x-webhook-secret'] || '';
+  if (secret !== CONFIG.webhookSecret) return res.status(401).json({ error: 'Uautoriseret' });
+
+  const raw    = sanitizeText(req.body.text || '', 2000);
+  const parsed = parseAgentReply(raw);
+  if (!parsed) return res.json({ ignored: true, reason: 'Ikke et !svar-kommando' });
+
+  // Find session via short ID
+  const { data: sessions } = await supabase
+    .from('sessions').select('*').eq('status', 'open').ilike('id', `${parsed.shortId}%`).limit(1);
+  const session = sessions?.[0];
+  if (!session) return res.json({ ignored: true, reason: 'Session ikke fundet' });
+
+  const textForCustomer = await translateToCustomerLang(parsed.message, session.lang || 'da');
+
+  const { data: msg, error } = await supabase
+    .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer, original_text: parsed.message })
+    .select().single();
+  if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
+
+  clearReminder(session.id);
+  sseBroadcast(session.id, 'message', msg); // push til widget via SSE
+  res.json({ saved: true, message: msg });
+});
+
+// ── POST /session/close ───────────────────────────────────────────────────────
+app.post('/session/close', async (req, res) => {
+  const sessionId = req.headers['x-session-id'];
+  if (!sessionId) return res.status(400).json({ error: 'X-Session-Id header mangler' });
+
+  const { data: session } = await supabase.from('sessions').select('name').eq('id', sessionId).single();
+  await supabase.from('sessions').update({ status: 'closed' }).eq('id', sessionId);
+  clearReminder(sessionId);
+
+  if (session) {
+    await postToTeams(adaptiveCard([
+      { type: 'TextBlock', text: `🔴 Chat lukket`, size: 'Medium', weight: 'Bolder', color: 'Attention' },
+      { type: 'FactSet', facts: [
+        { title: 'Kunde',   value: session.name },
+        { title: 'Session', value: makeShort(sessionId) },
+      ]},
+    ]));
+  }
+
+  sseBroadcast(sessionId, 'closed', { session_status: 'closed' });
+  res.json({ closed: true });
+});
+
+// ── Agent-endpoints (kræver X-Agent-Secret header) ───────────────────────────
+
+// GET /sessions – liste over alle sessioner
+app.get('/sessions', requireAgentAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('sessions').select('*').order('created_at', { ascending: false }).limit(200);
+  if (error) return res.status(500).json({ error: 'Kunne ikke hente sessioner' });
+  res.json({ sessions: data });
+});
+
+// GET /messages/:sessionId – hent alle beskeder for en session
+app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('messages').select('*').eq('session_id', req.params.sessionId).order('id');
+  if (error) return res.status(500).json({ error: 'Kunne ikke hente beskeder' });
+  res.json({ messages: data });
+});
+
+// POST /translate – agenten beder manuelt om oversættelse af en bestemt tekst til dansk
+// (bruges af "Oversæt"-knappen på kundebeskeder i agent-panelet)
+app.post('/translate', requireAgentAuth, async (req, res) => {
+  const text = sanitizeText(req.body.text || '', 2000);
+  if (!text) return res.status(400).json({ error: 'text kræves' });
+
+  const { translated } = await detectAndTranslateToDanish(text);
+  res.json({ translated });
+});
+
+// POST /agent/reply – agent sender svar direkte fra dashboard
+app.post('/agent/reply', requireAgentAuth, async (req, res) => {
+  const { sessionId, message } = req.body;
+  if (!sessionId || !message) return res.status(400).json({ error: 'sessionId og message kræves' });
+
+  const { data: session, error: sessErr } = await supabase
+    .from('sessions').select('*').eq('id', sessionId).single();
+  if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
+  if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
+
+  const originalText    = sanitizeText(message, 2000);
+  const textForCustomer = await translateToCustomerLang(originalText, session.lang || 'da');
+
+  // text = det kunden modtager (oversat); original_text = det agenten skrev (dansk),
+  // så agent-panelet altid kan vise sin egen besked på dansk, også efter refresh.
+  const { data: msg, error: msgErr } = await supabase
+    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer, original_text: originalText })
+    .select().single();
+  if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
+
+  clearReminder(sessionId);
+  sseBroadcast(sessionId, 'message', msg);
+  res.json({ message: msg });
+});
+
+// ── GET /health ───────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'login.html'));
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+const port = CONFIG.port;
+app.listen(port, () => {
+  console.log(`✅ Livechat server kører på port ${port}`);
+  console.log(`   Tilladte origins: ${CONFIG.allowedOrigins.join(', ')}`);
+  console.log(`   Teams webhook sat: ${CONFIG.teamsWebhookUrl ? 'ja' : '⚠️  mangler TEAMS_WEBHOOK_URL'}`);
+});
+
+module.exports = app; // kræves af Vercel
