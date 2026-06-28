@@ -23,12 +23,16 @@
  * );
  *
  * CREATE TABLE messages (
- *   id          BIGSERIAL PRIMARY KEY,
- *   session_id  TEXT REFERENCES sessions(id),
- *   role        TEXT NOT NULL,  -- 'customer' eller 'agent'
- *   text        TEXT NOT NULL,
- *   created_at  TIMESTAMPTZ DEFAULT now()
+ *   id             BIGSERIAL PRIMARY KEY,
+ *   session_id     TEXT REFERENCES sessions(id),
+ *   role           TEXT NOT NULL,  -- 'customer' eller 'agent'
+ *   text           TEXT NOT NULL,  -- det modtageren ser (kundens originale tekst, ELLER agentens tekst oversat til kundens sprog)
+ *   original_text  TEXT,           -- kun for role='agent': agentens originale danske tekst, til visning i agent-panelet
+ *   created_at     TIMESTAMPTZ DEFAULT now()
  * );
+ *
+ * -- Hvis tabellen allerede findes, tilføj kolonnen med:
+ * -- ALTER TABLE messages ADD COLUMN original_text TEXT;
  *
  * CREATE INDEX ON messages(session_id, id);
  * ─────────────────────────────────────────────
@@ -388,7 +392,7 @@ app.post('/webhook/teams', async (req, res) => {
   const textForCustomer = await translateToCustomerLang(parsed.message, session.lang || 'da');
 
   const { data: msg, error } = await supabase
-    .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer })
+    .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer, original_text: parsed.message })
     .select().single();
   if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
@@ -458,10 +462,13 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  const textForCustomer = await translateToCustomerLang(sanitizeText(message, 2000), session.lang || 'da');
+  const originalText    = sanitizeText(message, 2000);
+  const textForCustomer = await translateToCustomerLang(originalText, session.lang || 'da');
 
+  // text = det kunden modtager (oversat); original_text = det agenten skrev (dansk),
+  // så agent-panelet altid kan vise sin egen besked på dansk, også efter refresh.
   const { data: msg, error: msgErr } = await supabase
-    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
+    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer, original_text: originalText })
     .select().single();
   if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
