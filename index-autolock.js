@@ -336,21 +336,17 @@ app.post('/message/send',
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    const { translated: textForAgent, detectedLang } = await detectAndTranslateToDanish(text);
-
-    // Opdater sprog på sessionen hvis auto-detektion finder et ikke-dansk sprog
-    if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
-      await supabase.from('sessions').update({ lang: detectedLang }).eq('id', sessionId);
-      session.lang = detectedLang;
-    }
+    // Ingen auto-oversættelse her længere – kundens originale besked gemmes
+    // og vises som den er i agent-panelet. Sproget kommer fra session.lang,
+    // som widget'en satte ved session-start (browser-sprog).
 
     const { data: msg, error: msgErr } = await supabase
-      .from('messages').insert({ session_id: sessionId, role: 'customer', text: textForAgent })
+      .from('messages').insert({ session_id: sessionId, role: 'customer', text })
       .select().single();
     if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
     scheduleReminder(session);
-    await sendToTeams(sessionId, session.name, textForAgent);
+    await sendToTeams(sessionId, session.name, text);
 
     res.json({ message: msg });
   }
@@ -440,6 +436,16 @@ app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
     .from('messages').select('*').eq('session_id', req.params.sessionId).order('id');
   if (error) return res.status(500).json({ error: 'Kunne ikke hente beskeder' });
   res.json({ messages: data });
+});
+
+// POST /translate – agenten beder manuelt om oversættelse af en bestemt tekst til dansk
+// (bruges af "Oversæt"-knappen på kundebeskeder i agent-panelet)
+app.post('/translate', requireAgentAuth, async (req, res) => {
+  const text = sanitizeText(req.body.text || '', 2000);
+  if (!text) return res.status(400).json({ error: 'text kræves' });
+
+  const { translated } = await detectAndTranslateToDanish(text);
+  res.json({ translated });
 });
 
 // POST /agent/reply – agent sender svar direkte fra dashboard
