@@ -156,6 +156,24 @@
   .msg-agent { align-self: flex-end; background: linear-gradient(135deg, var(--red) 0%, var(--red-soft) 100%); color: #fff; font-weight: 500; border-bottom-right-radius: 3px; box-shadow: 0 2px 8px rgba(192,57,43,0.35); }
   .msg-system { align-self: center; font-size: 11.5px; color: var(--text-mute); padding: 2px 0; }
 
+  .msg-translate-btn {
+    align-self: flex-start;
+    margin-top: 3px; padding: 1px 0;
+    font-size: 11px; color: var(--text-mute);
+    background: none; border: none; cursor: pointer;
+    text-decoration: underline; transition: color 0.15s;
+  }
+  .msg-translate-btn:hover { color: var(--red-soft); }
+  .msg-translate-btn:disabled { cursor: default; text-decoration: none; opacity: 0.6; }
+  .msg-translation {
+    align-self: flex-start;
+    max-width: 72%;
+    font-size: 12px; color: var(--text-dim);
+    font-style: italic;
+    margin-top: 2px; padding: 0 2px;
+    line-height: 1.4;
+  }
+
   #no-chat {
     flex: 1; display: flex; align-items: center;
     justify-content: center; flex-direction: column;
@@ -269,7 +287,7 @@
 (function () {
   var API_BASE = 'https://livechat-ecru-seven.vercel.app';
   var AGENT_SECRET = 'p2nh7wqt5xm3rvkd8bjyfe6lcs4aguoz';
-  var sessions = {};          // id -> { id, name, email, phone, status, messages: [], unread: 0 }
+  var sessions = {};          // id -> { id, name, email, phone, lang, status, messages: [], unread: 0 }
   var activeSessionId = null;
   // Hent agentens navn fra auth (AutoLockAuth eller MSAL)
   var AGENT_NAME = (typeof AutoLockAuth !== 'undefined' && AutoLockAuth.getUsername && AutoLockAuth.getUsername()) || 'Agent';
@@ -277,6 +295,18 @@
   if (agentBadge) agentBadge.textContent = AGENT_NAME;
   var pollTimer = null;
   var isPolling = false;
+
+  // Sprognavne til visning i chat-meta (kode -> dansk visningsnavn)
+  var LANG_NAMES = {
+    da: 'Dansk', sv: 'Svensk', de: 'Tysk', en: 'Engelsk',
+    nb: 'Norsk', fi: 'Finsk', nl: 'Hollandsk', fr: 'Fransk',
+    es: 'Spansk', pl: 'Polsk'
+  };
+  function langLabel(code) {
+    if (!code) return null;
+    var c = code.toLowerCase();
+    return (LANG_NAMES[c] || c.toUpperCase()) + ' (' + c.toUpperCase() + ')';
+  }
 
   var sessionList  = document.getElementById('session-list');
   var emptyState   = document.getElementById('empty-state');
@@ -374,6 +404,7 @@
         sessions[s.id].name   = s.name;
         sessions[s.id].email  = s.email;
         sessions[s.id].phone  = s.phone;
+        sessions[s.id].lang   = s.lang;
         sessions[s.id].status = s.status;
       }
     });
@@ -483,6 +514,8 @@
     var meta = 'Session: ' + id.slice(0, 8);
     if (s.email) meta += ' · ' + s.email;
     if (s.phone) meta += ' · ' + s.phone;
+    var langText = langLabel(s.lang);
+    if (langText) meta += ' · ' + langText;
     if (isClosed) meta = '🔴 Lukket · ' + meta;
     chatMetaEl.textContent = meta;
 
@@ -568,9 +601,49 @@
 
       wrap.appendChild(label);
       wrap.appendChild(div);
+
+      // Manuel oversæt-knap for kundebeskeder
+      if (msg.role === 'customer') {
+        var transBtn = document.createElement('button');
+        transBtn.className = 'msg-translate-btn';
+        transBtn.textContent = 'Oversæt';
+        transBtn.addEventListener('click', function() {
+          translateCustomerMessage(msg.text, transBtn);
+        });
+        wrap.appendChild(transBtn);
+      }
     }
 
     messagesEl.appendChild(wrap);
+  }
+
+  function translateCustomerMessage(text, btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = 'Oversætter...';
+    fetch(API_BASE + '/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
+      body: JSON.stringify({ text: text })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.translated) {
+          var transEl = document.createElement('div');
+          transEl.className = 'msg-translation';
+          transEl.textContent = data.translated;
+          btnEl.parentNode.insertBefore(transEl, btnEl.nextSibling);
+          btnEl.remove();
+        } else {
+          btnEl.disabled = false;
+          btnEl.textContent = 'Oversæt';
+          showToast('Kunne ikke oversætte');
+        }
+      })
+      .catch(function() {
+        btnEl.disabled = false;
+        btnEl.textContent = 'Oversæt';
+        showToast('Kunne ikke oversætte');
+      });
   }
 
   function scrollMessages() {
