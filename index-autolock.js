@@ -1,7 +1,16 @@
 /**
- * AutoLock Livechat – Vercel + Supabase  (PRODUCTION READY)
+ * AutoLock Livechat – Vercel + Supabase
  *
- * Supabase tabeller:
+ * Ændringer fra original:
+ *  - In-memory Map() erstattet med Supabase (PostgreSQL)
+ *  - Long-polling erstattet med Server-Sent Events (SSE)
+ *  - Rate limiting på /session/start og /message/send
+ *  - Auth-middleware på agent-endpoints (/sessions, /messages, /agent/reply)
+ *  - CORS begrænset til kendte domæner via ALLOWED_ORIGINS env-variabel
+ *  - Input-validering og maks-længder på alle endpoints
+ *  - Webhook-secret valideres altid (ingen usikker fallback)
+ *
+ * Supabase tabeller (kør i Supabase SQL editor):
  * ─────────────────────────────────────────────
  * CREATE TABLE sessions (
  *   id          TEXT PRIMARY KEY,
@@ -16,19 +25,8 @@
  * CREATE TABLE messages (
  *   id          BIGSERIAL PRIMARY KEY,
  *   session_id  TEXT REFERENCES sessions(id),
- *   role        TEXT NOT NULL,   -- 'customer' | 'agent' | 'system'
+ *   role        TEXT NOT NULL,  -- 'customer' eller 'agent'
  *   text        TEXT NOT NULL,
- *   agent_name  TEXT,
- *   created_at  TIMESTAMPTZ DEFAULT now()
- * );
- *
- * CREATE TABLE offline_messages (
- *   id          BIGSERIAL PRIMARY KEY,
- *   name        TEXT NOT NULL,
- *   email       TEXT NOT NULL,
- *   phone       TEXT,
- *   message     TEXT NOT NULL,
- *   lang        TEXT DEFAULT 'da',
  *   created_at  TIMESTAMPTZ DEFAULT now()
  * );
  *
@@ -39,8 +37,8 @@
  *   SUPABASE_URL          – Fra Supabase → Project Settings → API
  *   SUPABASE_SERVICE_KEY  – Fra Supabase → Project Settings → API (service_role nøgle)
  *   WEBHOOK_SECRET        – Hemmeligt token delt med Power Automate
- *   AGENT_SECRET          – Hemmeligt token til agent-dashboard
- *   TEAMS_WEBHOOK_URL     – Power Automate webhook URL (valgfri)
+ *   AGENT_SECRET          – Hemmeligt token til agent-dashboard (sæt samme i agent-dashboard HTML)
+ *   TEAMS_WEBHOOK_URL     – Power Automate webhook URL
  *   ALLOWED_ORIGINS       – Kommasepareret: https://autolock.dk,https://autolock.se,...
  */
 
@@ -52,7 +50,7 @@ const crypto   = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const path = require('path');
 
-// ─── Boot-validering ─────────────────────────────────────────────────────────
+// ─── Konfiguration ────────────────────────────────────────────────────────────
 
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WEBHOOK_SECRET', 'AGENT_SECRET'];
 for (const key of REQUIRED_ENV) {
@@ -61,8 +59,6 @@ for (const key of REQUIRED_ENV) {
     process.exit(1);
   }
 }
-
-// ─── Konfiguration ────────────────────────────────────────────────────────────
 
 const CONFIG = {
   port:            process.env.PORT || 3001,
@@ -78,13 +74,12 @@ const CONFIG = {
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
-  { auth: { persistSession: false } }
+  process.env.SUPABASE_SERVICE_KEY
 );
 
 // ─── SSE: aktive lyttere pr. session ──────────────────────────────────────────
-
-const sseClients = new Map(); // Map<sessionId, Set<res>>
+// Map<sessionId, Set<res>>
+const sseClients = new Map();
 
 function sseSubscribe(sessionId, res) {
   if (!sseClients.has(sessionId)) sseClients.set(sessionId, new Set());
@@ -105,9 +100,11 @@ function sseBroadcast(sessionId, event, data) {
   }
 }
 
-// ─── Rate limiting (in-memory per instans) ────────────────────────────────────
+// ─── Rate limiting (in-memory, nulstilles ved server-genstart) ────────────────
+// På Vercel er dette per-instans – tilstrækkelig til at afbøde burst-angreb.
+// For produktions-grade rate limiting: brug Upstash Redis eller Vercel Edge Middleware.
 
-const rateLimitStore = new Map();
+const rateLimitStore = new Map(); // ip → { count, resetAt }
 
 function rateLimit(maxRequests, windowMs) {
   return (req, res, next) => {
@@ -217,13 +214,12 @@ function adaptiveCard(bodyBlocks) {
   };
 }
 
-function sendToTeams(sessionId, customerName, message, lang) {
+function sendToTeams(sessionId, customerName, message) {
   const short = makeShort(sessionId);
   return postToTeams(adaptiveCard([
     { type: 'TextBlock', text: `💬 Ny besked fra kunde`, size: 'Medium', weight: 'Bolder', color: 'Accent' },
     { type: 'FactSet', facts: [
       { title: 'Kunde',   value: customerName },
-      { title: 'Sprog',   value: (lang || 'da').toUpperCase() },
       { title: 'Session', value: short },
       { title: 'Besked',  value: message },
     ]},
@@ -239,14 +235,13 @@ function sendReminderToTeams(session) {
       { title: 'Kunde',   value: session.name },
       { title: 'Email',   value: session.email || '—' },
       { title: 'Telefon', value: session.phone || '—' },
-      { title: 'Sprog',   value: (session.lang || 'da').toUpperCase() },
       { title: 'Session', value: short },
     ]},
     { type: 'TextBlock', text: `**Svar:** \`${CONFIG.replyTrigger} ${short}: Dit svar\``, wrap: true, color: 'Good', spacing: 'Medium' },
   ]));
 }
 
-// ─── Reminder-timers ──────────────────────────────────────────────────────────
+// ─── Reminder-timers (in-memory er OK – de er ikke kritiske) ─────────────────
 
 const pendingReminders = new Map();
 
@@ -285,7 +280,7 @@ const app = express();
 app.use(express.json({ limit: '32kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// CORS
+// CORS – kun kendte origins
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin && CONFIG.allowedOrigins.includes(origin)) {
@@ -300,7 +295,7 @@ app.use((req, res, next) => {
 
 // ── POST /session/start ───────────────────────────────────────────────────────
 app.post('/session/start',
-  rateLimit(10, 60_000),
+  rateLimit(10, 60_000), // maks 10 nye sessioner/minut per IP
   async (req, res) => {
     const name  = sanitizeText(req.body.name  || 'Gæst', 100);
     const email = sanitizeText(req.body.email || '', 200) || null;
@@ -328,7 +323,7 @@ app.post('/session/start',
 
 // ── POST /message/send ────────────────────────────────────────────────────────
 app.post('/message/send',
-  rateLimit(30, 60_000),
+  rateLimit(30, 60_000), // maks 30 beskeder/minut per IP
   async (req, res) => {
     const sessionId = req.headers['x-session-id'];
     const text      = sanitizeText(req.body.message || '', 2000);
@@ -341,10 +336,9 @@ app.post('/message/send',
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    // Oversæt kundens besked til dansk til agenten
     const { translated: textForAgent, detectedLang } = await detectAndTranslateToDanish(text);
 
-    // Opdater sprog hvis auto-detektion finder noget nyt
+    // Opdater sprog på sessionen hvis auto-detektion finder et ikke-dansk sprog
     if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
       await supabase.from('sessions').update({ lang: detectedLang }).eq('id', sessionId);
       session.lang = detectedLang;
@@ -356,13 +350,14 @@ app.post('/message/send',
     if (msgErr) { console.error('[message/send]', msgErr); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
     scheduleReminder(session);
-    await sendToTeams(sessionId, session.name, textForAgent, session.lang);
+    await sendToTeams(sessionId, session.name, textForAgent);
 
     res.json({ message: msg });
   }
 );
 
-// ── GET /message/sse – Server-Sent Events ─────────────────────────────────────
+// ── GET /message/sse – Server-Sent Events (erstatter long-poll) ───────────────
+// Widget lytter her efter agent-svar i realtid.
 app.get('/message/sse', (req, res) => {
   const sessionId = req.headers['x-session-id'] || req.query.session_id;
   if (!sessionId) return res.status(400).json({ error: 'session_id mangler' });
@@ -372,47 +367,12 @@ app.get('/message/sse', (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
+  // Heartbeat hvert 25s for at holde forbindelsen i live
   const hb = setInterval(() => { try { res.write(': heartbeat\n\n'); } catch (_) {} }, 25_000);
 
   sseSubscribe(sessionId, res);
   req.on('close', () => { clearInterval(hb); sseUnsubscribe(sessionId, res); });
 });
-
-// ── POST /offline/message – efterlad besked når kontoret er lukket ────────────
-app.post('/offline/message',
-  rateLimit(5, 60_000),
-  async (req, res) => {
-    const name    = sanitizeText(req.body.name    || '', 100);
-    const email   = sanitizeText(req.body.email   || '', 200);
-    const phone   = sanitizeText(req.body.phone   || '', 30) || null;
-    const message = sanitizeText(req.body.message || '', 2000);
-    const lang    = sanitizeLang(req.body.lang);
-
-    if (!name)    return res.status(400).json({ error: 'Navn er påkrævet' });
-    if (!email)   return res.status(400).json({ error: 'E-mail er påkrævet' });
-    if (!message) return res.status(400).json({ error: 'Besked er påkrævet' });
-
-    // Gem i Supabase
-    const { error: dbErr } = await supabase
-      .from('offline_messages')
-      .insert({ name, email, phone, message, lang });
-    if (dbErr) console.error('[offline/message] db error:', dbErr);
-
-    // Send notifikation til Teams
-    await postToTeams(adaptiveCard([
-      { type: 'TextBlock', text: `📩 Offline besked modtaget`, size: 'Medium', weight: 'Bolder', color: 'Warning' },
-      { type: 'FactSet', facts: [
-        { title: 'Navn',    value: name },
-        { title: 'Email',   value: email },
-        { title: 'Telefon', value: phone || '—' },
-        { title: 'Sprog',   value: lang.toUpperCase() },
-        { title: 'Besked',  value: message },
-      ]},
-    ]));
-
-    res.json({ saved: true });
-  }
-);
 
 // ── POST /webhook/teams ───────────────────────────────────────────────────────
 app.post('/webhook/teams', async (req, res) => {
@@ -423,6 +383,7 @@ app.post('/webhook/teams', async (req, res) => {
   const parsed = parseAgentReply(raw);
   if (!parsed) return res.json({ ignored: true, reason: 'Ikke et !svar-kommando' });
 
+  // Find session via short ID
   const { data: sessions } = await supabase
     .from('sessions').select('*').eq('status', 'open').ilike('id', `${parsed.shortId}%`).limit(1);
   const session = sessions?.[0];
@@ -436,7 +397,7 @@ app.post('/webhook/teams', async (req, res) => {
   if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
   clearReminder(session.id);
-  sseBroadcast(session.id, 'message', msg);
+  sseBroadcast(session.id, 'message', msg); // push til widget via SSE
   res.json({ saved: true, message: msg });
 });
 
@@ -463,9 +424,9 @@ app.post('/session/close', async (req, res) => {
   res.json({ closed: true });
 });
 
-// ── Agent-endpoints ───────────────────────────────────────────────────────────
+// ── Agent-endpoints (kræver X-Agent-Secret header) ───────────────────────────
 
-// GET /sessions
+// GET /sessions – liste over alle sessioner
 app.get('/sessions', requireAgentAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('sessions').select('*').order('created_at', { ascending: false }).limit(200);
@@ -473,7 +434,7 @@ app.get('/sessions', requireAgentAuth, async (req, res) => {
   res.json({ sessions: data });
 });
 
-// GET /messages/:sessionId
+// GET /messages/:sessionId – hent alle beskeder for en session
 app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('messages').select('*').eq('session_id', req.params.sessionId).order('id');
@@ -481,9 +442,9 @@ app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
   res.json({ messages: data });
 });
 
-// POST /agent/reply – agent sender svar fra dashboard (inkl. agentName)
+// POST /agent/reply – agent sender svar direkte fra dashboard
 app.post('/agent/reply', requireAgentAuth, async (req, res) => {
-  const { sessionId, message, agentName } = req.body;
+  const { sessionId, message } = req.body;
   if (!sessionId || !message) return res.status(400).json({ error: 'sessionId og message kræves' });
 
   const { data: session, error: sessErr } = await supabase
@@ -491,18 +452,15 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  // Agenten skriver altid på dansk — oversæt til kundens sprog
   const textForCustomer = await translateToCustomerLang(sanitizeText(message, 2000), session.lang || 'da');
-  const safeAgentName   = sanitizeText(agentName || 'Agent', 80);
 
   const { data: msg, error: msgErr } = await supabase
-    .from('messages')
-    .insert({ session_id: sessionId, role: 'agent', text: textForCustomer, agent_name: safeAgentName })
+    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
     .select().single();
   if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
   clearReminder(sessionId);
-  sseBroadcast(session.id, 'message', msg);
+  sseBroadcast(sessionId, 'message', msg);
   res.json({ message: msg });
 });
 
@@ -523,4 +481,4 @@ app.listen(port, () => {
   console.log(`   Teams webhook sat: ${CONFIG.teamsWebhookUrl ? 'ja' : '⚠️  mangler TEAMS_WEBHOOK_URL'}`);
 });
 
-module.exports = app;
+module.exports = app; // kræves af Vercel
