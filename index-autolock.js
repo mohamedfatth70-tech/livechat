@@ -53,12 +53,13 @@ const { createClient } = require('@supabase/supabase-js');
 const path = require('path');
 
 // ─── Boot-validering ─────────────────────────────────────────────────────────
+// RETTET: process.exit(1) crasher Vercel – logger fejl i stedet og lader
+// de individuelle endpoints returnere 500 hvis Supabase ikke er konfigureret.
 
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WEBHOOK_SECRET', 'AGENT_SECRET'];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
     console.error(`[boot] FEJL: Miljøvariabel '${key}' mangler. Sæt den i Vercel dashboard.`);
-    process.exit(1);
   }
 }
 
@@ -341,10 +342,8 @@ app.post('/message/send',
     if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
     if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-    // Oversæt kundens besked til dansk til agenten
     const { translated: textForAgent, detectedLang } = await detectAndTranslateToDanish(text);
 
-    // Opdater sprog hvis auto-detektion finder noget nyt
     if (detectedLang && detectedLang !== 'da' && detectedLang !== session.lang) {
       await supabase.from('sessions').update({ lang: detectedLang }).eq('id', sessionId);
       session.lang = detectedLang;
@@ -378,7 +377,7 @@ app.get('/message/sse', (req, res) => {
   req.on('close', () => { clearInterval(hb); sseUnsubscribe(sessionId, res); });
 });
 
-// ── POST /offline/message – efterlad besked når kontoret er lukket ────────────
+// ── POST /offline/message ─────────────────────────────────────────────────────
 app.post('/offline/message',
   rateLimit(5, 60_000),
   async (req, res) => {
@@ -392,13 +391,11 @@ app.post('/offline/message',
     if (!email)   return res.status(400).json({ error: 'E-mail er påkrævet' });
     if (!message) return res.status(400).json({ error: 'Besked er påkrævet' });
 
-    // Gem i Supabase
     const { error: dbErr } = await supabase
       .from('offline_messages')
       .insert({ name, email, phone, message, lang });
     if (dbErr) console.error('[offline/message] db error:', dbErr);
 
-    // Send notifikation til Teams
     await postToTeams(adaptiveCard([
       { type: 'TextBlock', text: `📩 Offline besked modtaget`, size: 'Medium', weight: 'Bolder', color: 'Warning' },
       { type: 'FactSet', facts: [
@@ -465,7 +462,6 @@ app.post('/session/close', async (req, res) => {
 
 // ── Agent-endpoints ───────────────────────────────────────────────────────────
 
-// GET /sessions
 app.get('/sessions', requireAgentAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('sessions').select('*').order('created_at', { ascending: false }).limit(200);
@@ -473,7 +469,6 @@ app.get('/sessions', requireAgentAuth, async (req, res) => {
   res.json({ sessions: data });
 });
 
-// GET /messages/:sessionId
 app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('messages').select('*').eq('session_id', req.params.sessionId).order('id');
@@ -481,7 +476,6 @@ app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
   res.json({ messages: data });
 });
 
-// POST /agent/reply – agent sender svar fra dashboard (inkl. agentName)
 app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   const { sessionId, message, agentName } = req.body;
   if (!sessionId || !message) return res.status(400).json({ error: 'sessionId og message kræves' });
@@ -491,7 +485,6 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  // Agenten skriver altid på dansk — oversæt til kundens sprog
   const textForCustomer = await translateToCustomerLang(sanitizeText(message, 2000), session.lang || 'da');
   const safeAgentName   = sanitizeText(agentName || 'Agent', 80);
 
@@ -515,12 +508,22 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'login.html'));
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-const port = CONFIG.port;
-app.listen(port, () => {
-  console.log(`✅ Livechat server kører på port ${port}`);
+// ─── Start (lokal) / Vercel export ───────────────────────────────────────────
+// RETTET: app.listen() må ikke kaldes på Vercel – kun lokalt.
+// module.exports skal stå UDEN app.listen() for at Vercel virker.
+if (require.main === module) {
+  // Køres direkte med `node index-autolock.js` – lokal udvikling
+  const port = CONFIG.port;
+  app.listen(port, () => {
+    console.log(`✅ Livechat server kører på port ${port}`);
+    console.log(`   Tilladte origins: ${CONFIG.allowedOrigins.join(', ')}`);
+    console.log(`   Teams webhook sat: ${CONFIG.teamsWebhookUrl ? 'ja' : '⚠️  mangler TEAMS_WEBHOOK_URL'}`);
+  });
+} else {
+  // Importeret af Vercel – kun log, ingen listen()
+  console.log(`✅ Kører som Vercel serverless function`);
   console.log(`   Tilladte origins: ${CONFIG.allowedOrigins.join(', ')}`);
   console.log(`   Teams webhook sat: ${CONFIG.teamsWebhookUrl ? 'ja' : '⚠️  mangler TEAMS_WEBHOOK_URL'}`);
-});
+}
 
 module.exports = app;
