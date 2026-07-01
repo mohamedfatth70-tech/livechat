@@ -181,6 +181,58 @@
   }
   #no-chat svg { width: 48px; height: 48px; fill: var(--border2); }
 
+  /* Claim knap */
+  .claim-btn {
+    padding: 4px 11px; font-size: 11px; font-weight: 700;
+    border-radius: 5px; cursor: pointer; border: 1px solid;
+    transition: background 0.15s, color 0.15s;
+  }
+  .claim-btn.unclaimed {
+    background: #0a1a0a; color: #6effa0; border-color: #1a4a1a;
+  }
+  .claim-btn.unclaimed:hover { background: #122012; }
+  .claim-btn.claimed-by-me {
+    background: #1a0505; color: #fc8181; border-color: var(--red-dark);
+  }
+  .claim-btn.claimed-by-me:hover { background: #2a0a0a; }
+  .claim-btn.claimed-by-other {
+    background: var(--bg4); color: var(--text-mute); border-color: var(--border);
+    cursor: default;
+  }
+  #claim-badge {
+    font-size: 11px; color: #6effa0; background: rgba(110,255,160,0.08);
+    border: 1px solid rgba(110,255,160,0.2); border-radius: 10px;
+    padding: 2px 8px; margin-left: 8px; display: none;
+  }
+
+  /* Kunde URL */
+  #customer-url-bar {
+    display: none; align-items: center; gap: 6px;
+    padding: 5px 20px; background: var(--bg4);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px; color: var(--text-mute); flex-shrink: 0;
+  }
+  #customer-url-bar a {
+    color: var(--text-dim); text-decoration: none;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 500px; display: inline-block;
+  }
+  #customer-url-bar a:hover { color: var(--red-soft); text-decoration: underline; }
+
+  /* Oversættelses-preview */
+  #translation-preview {
+    display: none;
+    margin: 0 16px 8px; padding: 8px 12px;
+    background: var(--bg4); border: 1px solid var(--border2);
+    border-radius: 8px; font-size: 12px; color: var(--text-dim);
+    font-style: italic; line-height: 1.5;
+  }
+  #translation-preview .preview-label {
+    font-style: normal; font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-mute); margin-bottom: 3px;
+  }
+
   #input-bar {
     background: var(--bg2);
     border-top: 1px solid var(--border);
@@ -261,10 +313,17 @@
   <div id="chat-panel">
     <div id="chat-header">
       <div>
-        <div id="chat-name">Vælg en chat</div>
+        <div id="chat-name" style="display:flex;align-items:center;gap:6px;">Vælg en chat <span id="claim-badge"></span></div>
         <div id="chat-meta"></div>
       </div>
-      <button id="close-session-btn" onclick="closeSession()">Afslut chat</button>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button id="claim-btn" class="claim-btn unclaimed" onclick="toggleClaim()" style="display:none;">Claim chat</button>
+        <button id="close-session-btn" onclick="closeSession()">Afslut chat</button>
+      </div>
+    </div>
+    <div id="customer-url-bar">
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
+      Kundens side: <a id="customer-url-link" href="#" target="_blank" rel="noopener"></a>
     </div>
 
     <div id="no-chat">
@@ -273,6 +332,11 @@
     </div>
 
     <div id="messages"></div>
+
+    <div id="translation-preview">
+      <div class="preview-label">Kunden modtager (oversat):</div>
+      <span id="preview-text"></span>
+    </div>
 
     <div id="input-bar">
       <textarea id="agent-input" rows="1" placeholder="Skriv svar til kunde..."></textarea>
@@ -287,8 +351,9 @@
 (function () {
   var API_BASE = 'https://livechat-ecru-seven.vercel.app';
   var AGENT_SECRET = 'p2nh7wqt5xm3rvkd8bjyfe6lcs4aguoz';
-  var sessions = {};          // id -> { id, name, email, phone, lang, status, messages: [], unread: 0 }
+  var sessions = {};          // id -> { id, name, email, phone, lang, status, claimed_by, page_url, messages: [], unread: 0 }
   var activeSessionId = null;
+  var previewTimer = null;
   // Hent agentens navn fra auth (AutoLockAuth eller MSAL)
   var AGENT_NAME = (typeof AutoLockAuth !== 'undefined' && AutoLockAuth.getUsername && AutoLockAuth.getUsername()) || 'Agent';
   var agentBadge = document.getElementById('agent-name-badge');
@@ -318,10 +383,16 @@
   var inputBar     = document.getElementById('input-bar');
   var agentInput   = document.getElementById('agent-input');
   var sendBtn      = document.getElementById('send-btn');
-  var closeBtn     = document.getElementById('close-session-btn');
-  var statusDot    = document.getElementById('status-dot');
-  var statusText   = document.getElementById('status-text');
-  var toastEl      = document.getElementById('toast');
+  var closeBtn       = document.getElementById('close-session-btn');
+  var claimBtn       = document.getElementById('claim-btn');
+  var claimBadge     = document.getElementById('claim-badge');
+  var customerUrlBar = document.getElementById('customer-url-bar');
+  var customerUrlLink= document.getElementById('customer-url-link');
+  var transPrev      = document.getElementById('translation-preview');
+  var previewText    = document.getElementById('preview-text');
+  var statusDot      = document.getElementById('status-dot');
+  var statusText     = document.getElementById('status-text');
+  var toastEl        = document.getElementById('toast');
 
   requestNotifPermission();
   startPolling();
@@ -394,18 +465,22 @@
     // Detect new sessions
     open.forEach(function(s) {
       if (!sessions[s.id]) {
-        sessions[s.id] = Object.assign({}, s, { messages: [], unread: 0 });
+        sessions[s.id] = Object.assign({}, s, { messages: [], unread: 0, claimed_by: s.claimed_by || null, page_url: s.page_url || null });
         showToast('Ny kunde: ' + s.name);
         if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
           new Notification('AutoLock Chat', { body: s.name + ' har startet en chat' });
         }
       } else {
         // Update metadata but preserve messages/unread
-        sessions[s.id].name   = s.name;
-        sessions[s.id].email  = s.email;
-        sessions[s.id].phone  = s.phone;
-        sessions[s.id].lang   = s.lang;
-        sessions[s.id].status = s.status;
+        sessions[s.id].name       = s.name;
+        sessions[s.id].email      = s.email;
+        sessions[s.id].phone      = s.phone;
+        sessions[s.id].lang       = s.lang;
+        sessions[s.id].status     = s.status;
+        sessions[s.id].claimed_by = s.claimed_by || null;
+        sessions[s.id].page_url   = s.page_url   || null;
+        // Opdatér claim UI hvis dette er den aktive session
+        if (activeSessionId === s.id) updateClaimUI(sessions[s.id]);
       }
     });
 
@@ -510,7 +585,7 @@
     s.unread = 0;
     var isClosed = s.status !== 'open';
 
-    chatNameEl.textContent = s.name || 'Kunde';
+    chatNameEl.childNodes[0].textContent = s.name || 'Kunde';
     var meta = 'Session: ' + id.slice(0, 8);
     if (s.email) meta += ' · ' + s.email;
     if (s.phone) meta += ' · ' + s.phone;
@@ -518,6 +593,21 @@
     if (langText) meta += ' · ' + langText;
     if (isClosed) meta = '🔴 Lukket · ' + meta;
     chatMetaEl.textContent = meta;
+
+    // Vis kundens URL
+    if (s.page_url) {
+      customerUrlLink.href = s.page_url;
+      customerUrlLink.textContent = s.page_url;
+      customerUrlBar.style.display = 'flex';
+    } else {
+      customerUrlBar.style.display = 'none';
+    }
+
+    // Claim UI
+    updateClaimUI(s);
+
+    // Skjul preview ved skift
+    transPrev.style.display = 'none';
 
     messagesEl.style.display = 'flex';
     noChatEl.style.display = 'none';
@@ -602,24 +692,35 @@
       wrap.appendChild(label);
       wrap.appendChild(div);
 
-      // Manuel oversæt-knap for kundebeskeder
+      // Kundebeskeder: auto-oversæt til dansk hvis sproget ikke er dansk
       if (msg.role === 'customer') {
-        var transBtn = document.createElement('button');
-        transBtn.className = 'msg-translate-btn';
-        transBtn.textContent = 'Oversæt';
-        transBtn.addEventListener('click', function() {
-          translateCustomerMessage(msg.text, transBtn);
-        });
-        wrap.appendChild(transBtn);
+        var s = activeSessionId ? sessions[activeSessionId] : null;
+        var customerLang = s ? s.lang : 'da';
+        if (customerLang && customerLang !== 'da') {
+          // Vis oversat version automatisk
+          var transEl = document.createElement('div');
+          transEl.className = 'msg-translation';
+          transEl.textContent = 'Oversætter...';
+          wrap.appendChild(transEl);
+          translateCustomerMessage(msg.text, null, transEl);
+        } else {
+          // Sproget er dansk – vis oversæt-knap manuelt som backup
+          var transBtn = document.createElement('button');
+          transBtn.className = 'msg-translate-btn';
+          transBtn.textContent = 'Oversæt';
+          transBtn.addEventListener('click', function() {
+            translateCustomerMessage(msg.text, transBtn, null);
+          });
+          wrap.appendChild(transBtn);
+        }
       }
     }
 
     messagesEl.appendChild(wrap);
   }
 
-  function translateCustomerMessage(text, btnEl) {
-    btnEl.disabled = true;
-    btnEl.textContent = 'Oversætter...';
+  function translateCustomerMessage(text, btnEl, targetEl) {
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Oversætter...'; }
     fetch(API_BASE + '/translate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
@@ -628,21 +729,25 @@
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (data.translated) {
-          var transEl = document.createElement('div');
-          transEl.className = 'msg-translation';
-          transEl.textContent = data.translated;
-          btnEl.parentNode.insertBefore(transEl, btnEl.nextSibling);
-          btnEl.remove();
+          if (targetEl) {
+            // Auto-oversættelse: opdatér eksisterende element
+            targetEl.textContent = '🇩🇰 ' + data.translated;
+          } else if (btnEl) {
+            // Manuel: erstat knappen med oversat tekst
+            var el = document.createElement('div');
+            el.className = 'msg-translation';
+            el.textContent = '🇩🇰 ' + data.translated;
+            btnEl.parentNode.insertBefore(el, btnEl.nextSibling);
+            btnEl.remove();
+          }
         } else {
-          btnEl.disabled = false;
-          btnEl.textContent = 'Oversæt';
-          showToast('Kunne ikke oversætte');
+          if (targetEl) { targetEl.textContent = '(Oversættelse mislykkedes)'; }
+          if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Oversæt'; showToast('Kunne ikke oversætte'); }
         }
       })
       .catch(function() {
-        btnEl.disabled = false;
-        btnEl.textContent = 'Oversæt';
-        showToast('Kunne ikke oversætte');
+        if (targetEl) { targetEl.textContent = '(Oversættelse mislykkedes)'; }
+        if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Oversæt'; showToast('Kunne ikke oversætte'); }
       });
   }
 
@@ -656,6 +761,8 @@
 
     agentInput.value = '';
     agentInput.style.height = 'auto';
+    transPrev.style.display = 'none';
+    if (previewTimer) { clearTimeout(previewTimer); previewTimer = null; }
     sendBtn.disabled = true;
 
     fetch(API_BASE + '/agent/reply', { // requires agent auth
@@ -685,6 +792,52 @@
       sendBtn.disabled = false;
       showToast('Svar kunne ikke sendes');
     });
+  };
+
+  function updateClaimUI(s) {
+    if (!s || s.status !== 'open') {
+      claimBtn.style.display = 'none';
+      claimBadge.style.display = 'none';
+      return;
+    }
+    claimBtn.style.display = 'inline-block';
+    if (!s.claimed_by) {
+      claimBtn.textContent = 'Claim chat';
+      claimBtn.className = 'claim-btn unclaimed';
+      claimBadge.style.display = 'none';
+    } else if (s.claimed_by === AGENT_NAME) {
+      claimBtn.textContent = 'Slip chat';
+      claimBtn.className = 'claim-btn claimed-by-me';
+      claimBadge.textContent = '✓ Dig';
+      claimBadge.style.display = 'inline-block';
+    } else {
+      claimBtn.textContent = 'Claimer: ' + s.claimed_by;
+      claimBtn.className = 'claim-btn claimed-by-other';
+      claimBadge.textContent = s.claimed_by;
+      claimBadge.style.display = 'inline-block';
+    }
+  }
+
+  window.toggleClaim = function () {
+    if (!activeSessionId) return;
+    var s = sessions[activeSessionId];
+    if (!s || s.status !== 'open') return;
+    // Hvis allerede claimet af en anden, gør ingenting
+    if (s.claimed_by && s.claimed_by !== AGENT_NAME) return;
+
+    var newAgent = s.claimed_by === AGENT_NAME ? null : AGENT_NAME;
+    fetch(API_BASE + '/session/claim', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
+      body: JSON.stringify({ sessionId: activeSessionId, agentName: newAgent })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      s.claimed_by = data.claimed_by;
+      updateClaimUI(s);
+      showToast(data.claimed_by ? ('Chat claimet af ' + data.claimed_by) : 'Chat frigivet');
+    })
+    .catch(function() { showToast('Kunne ikke opdatere claim'); });
   };
 
   window.closeSession = function () {
@@ -721,6 +874,31 @@
   agentInput.addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 100) + 'px';
+
+    // Oversættelses-preview (debounced 600ms)
+    var text = this.value.trim();
+    if (previewTimer) clearTimeout(previewTimer);
+    if (!text || !activeSessionId) {
+      transPrev.style.display = 'none';
+      return;
+    }
+    var s = sessions[activeSessionId];
+    if (!s || s.lang === 'da') { transPrev.style.display = 'none'; return; }
+
+    previewTimer = setTimeout(function() {
+      fetch(API_BASE + '/agent/translate-preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Agent-Secret': AGENT_SECRET },
+        body: JSON.stringify({ sessionId: activeSessionId, text: text })
+      })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.same_lang) { transPrev.style.display = 'none'; return; }
+        previewText.textContent = data.preview || '';
+        transPrev.style.display = 'block';
+      })
+      .catch(function() { transPrev.style.display = 'none'; });
+    }, 600);
   });
 
   function esc(s) {
