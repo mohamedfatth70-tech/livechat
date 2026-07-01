@@ -23,16 +23,12 @@
  * );
  *
  * CREATE TABLE messages (
- *   id             BIGSERIAL PRIMARY KEY,
- *   session_id     TEXT REFERENCES sessions(id),
- *   role           TEXT NOT NULL,  -- 'customer' eller 'agent'
- *   text           TEXT NOT NULL,  -- det modtageren ser (kundens originale tekst, ELLER agentens tekst oversat til kundens sprog)
- *   original_text  TEXT,           -- kun for role='agent': agentens originale danske tekst, til visning i agent-panelet
- *   created_at     TIMESTAMPTZ DEFAULT now()
+ *   id          BIGSERIAL PRIMARY KEY,
+ *   session_id  TEXT REFERENCES sessions(id),
+ *   role        TEXT NOT NULL,  -- 'customer' eller 'agent'
+ *   text        TEXT NOT NULL,
+ *   created_at  TIMESTAMPTZ DEFAULT now()
  * );
- *
- * -- Hvis tabellen allerede findes, tilføj kolonnen med:
- * -- ALTER TABLE messages ADD COLUMN original_text TEXT;
  *
  * CREATE INDEX ON messages(session_id, id);
  * ─────────────────────────────────────────────
@@ -56,7 +52,7 @@ const path = require('path');
 
 // ─── Konfiguration ────────────────────────────────────────────────────────────
 
-const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WEBHOOK_SECRET', 'AGENT_SECRET'];
+const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WEBHOOK_SECRET', 'AGENT_SECRET', 'AZURE_TRANSLATOR_KEY', 'AZURE_TRANSLATOR_REGION'];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
     console.error(`[boot] FEJL: Miljøvariabel '${key}' mangler. Sæt den i Vercel dashboard.`);
@@ -72,6 +68,9 @@ const CONFIG = {
   replyTrigger:    '!svar',
   allowedOrigins:  (process.env.ALLOWED_ORIGINS || 'http://localhost:3001')
                      .split(',').map(s => s.trim()).filter(Boolean),
+  azureTranslatorKey:      process.env.AZURE_TRANSLATOR_KEY,
+  azureTranslatorRegion:   process.env.AZURE_TRANSLATOR_REGION,
+  azureTranslatorEndpoint: process.env.AZURE_TRANSLATOR_ENDPOINT || 'api.cognitive.microsofttranslator.com',
 };
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
@@ -153,37 +152,72 @@ function sanitizeText(str, maxLen = 2000) {
   return str.trim().slice(0, maxLen);
 }
 
-// ─── Oversættelse via MyMemory ────────────────────────────────────────────────
+// ─── Oversættelse via Microsoft Azure Translator ──────────────────────────────
 
-function httpGet(url) {
+function httpPostJson(hostname, path, body, headers = {}) {
   return new Promise((resolve) => {
-    https.get(url, (res) => {
+    const payload = JSON.stringify(body);
+    const req = https.request({
+      hostname,
+      path,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        ...headers,
+      },
+    }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => resolve(data));
-    }).on('error', () => resolve(null));
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(10000, () => { req.destroy(); resolve(null); });
+    req.write(payload);
+    req.end();
   });
+}
+
+async function azureTranslate(text, targetLang, sourceLang) {
+  if (!text?.trim()) return { translated: text, detectedLang: sourceLang || 'da' };
+  if (!CONFIG.azureTranslatorKey || !CONFIG.azureTranslatorRegion) {
+    console.error('[translate] Azure Translator er ikke konfigureret (AZURE_TRANSLATOR_KEY/REGION mangler)');
+    return { translated: text, detectedLang: sourceLang || 'da' };
+  }
+  try {
+    const params = new URLSearchParams({ 'api-version': '3.0', to: targetLang });
+    if (sourceLang) params.set('from', sourceLang);
+    const path = `/translate?${params.toString()}`;
+    const raw = await httpPostJson(
+      CONFIG.azureTranslatorEndpoint,
+      path,
+      [{ Text: text }],
+      {
+        'Ocp-Apim-Subscription-Key':    CONFIG.azureTranslatorKey,
+        'Ocp-Apim-Subscription-Region': CONFIG.azureTranslatorRegion,
+      }
+    );
+    const json = JSON.parse(raw);
+    const result = json?.[0];
+    return {
+      translated:   result?.translations?.[0]?.text || text,
+      detectedLang: result?.detectedLanguage?.language || sourceLang || 'da',
+    };
+  } catch (err) {
+    console.error('[translate] Azure Translator-fejl:', err.message);
+    return { translated: text, detectedLang: sourceLang || 'da' };
+  }
 }
 
 async function detectAndTranslateToDanish(text) {
   if (!text?.trim()) return { translated: text, detectedLang: 'da' };
-  try {
-    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=autodetect|da`);
-    const json = JSON.parse(raw);
-    return {
-      translated:   json.responseData?.translatedText || text,
-      detectedLang: json.matches?.[0]?.source || 'da',
-    };
-  } catch { return { translated: text, detectedLang: 'da' }; }
+  return azureTranslate(text, 'da');
 }
 
 async function translateToCustomerLang(text, targetLang) {
   if (!text?.trim() || !targetLang || targetLang === 'da') return text;
-  try {
-    const raw  = await httpGet(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=da|${targetLang}`);
-    const json = JSON.parse(raw);
-    return json.responseData?.translatedText || text;
-  } catch { return text; }
+  const { translated } = await azureTranslate(text, targetLang, 'da');
+  return translated;
 }
 
 // ─── Teams webhook ────────────────────────────────────────────────────────────
@@ -392,7 +426,7 @@ app.post('/webhook/teams', async (req, res) => {
   const textForCustomer = await translateToCustomerLang(parsed.message, session.lang || 'da');
 
   const { data: msg, error } = await supabase
-    .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer, original_text: parsed.message })
+    .from('messages').insert({ session_id: session.id, role: 'agent', text: textForCustomer })
     .select().single();
   if (error) { console.error('[webhook/teams]', error); return res.status(500).json({ error: 'Kunne ikke gemme besked' }); }
 
@@ -462,13 +496,10 @@ app.post('/agent/reply', requireAgentAuth, async (req, res) => {
   if (sessErr || !session) return res.status(404).json({ error: 'Session ikke fundet' });
   if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
 
-  const originalText    = sanitizeText(message, 2000);
-  const textForCustomer = await translateToCustomerLang(originalText, session.lang || 'da');
+  const textForCustomer = await translateToCustomerLang(sanitizeText(message, 2000), session.lang || 'da');
 
-  // text = det kunden modtager (oversat); original_text = det agenten skrev (dansk),
-  // så agent-panelet altid kan vise sin egen besked på dansk, også efter refresh.
   const { data: msg, error: msgErr } = await supabase
-    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer, original_text: originalText })
+    .from('messages').insert({ session_id: sessionId, role: 'agent', text: textForCustomer })
     .select().single();
   if (msgErr) return res.status(500).json({ error: 'Kunne ikke gemme besked' });
 
