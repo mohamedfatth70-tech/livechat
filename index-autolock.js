@@ -19,6 +19,8 @@
  *   phone       TEXT,
  *   lang        TEXT DEFAULT 'da',
  *   status      TEXT DEFAULT 'open',
+ *   claimed_by  TEXT,           -- agentens navn der har claimet chatten
+ *   page_url    TEXT,           -- URL på siden kunden skrev fra
  *   created_at  TIMESTAMPTZ DEFAULT now()
  * );
  *
@@ -335,14 +337,31 @@ app.use((req, res, next) => {
 app.post('/session/start',
   rateLimit(10, 60_000), // maks 10 nye sessioner/minut per IP
   async (req, res) => {
-    const name  = sanitizeText(req.body.name  || 'Gæst', 100);
-    const email = sanitizeText(req.body.email || '', 200) || null;
-    const phone = sanitizeText(req.body.phone || '', 30)  || null;
-    const lang  = sanitizeLang(req.body.lang);
-    const id    = makeId();
+    const name     = sanitizeText(req.body.name     || 'Gæst', 100);
+    const email    = sanitizeText(req.body.email    || '' , 200) || null;
+    const phone    = sanitizeText(req.body.phone    || ''  , 30)  || null;
+    const lang     = sanitizeLang(req.body.lang);
+    const page_url = sanitizeText(req.body.page_url || '' , 500) || null;
+    const id       = makeId();
 
-    const { error } = await supabase.from('sessions').insert({ id, name, email, phone, lang, status: 'open' });
+    const { error } = await supabase.from('sessions').insert({ id, name, email, phone, lang, page_url, status: 'open' });
     if (error) { console.error('[session/start]', error); return res.status(500).json({ error: 'Kunne ikke oprette session' }); }
+
+    // Send automatisk velkomstbesked til kunden via SSE
+    const welcomeTexts = {
+      da: 'Vi er ved at finde en ledig medarbejder til dig. Et øjeblik...',
+      sv: 'Vi letar efter en ledig medarbetare. Ett ögonblick...',
+      de: 'Wir suchen einen verfügbaren Mitarbeiter für Sie. Einen Moment...',
+      en: 'We are finding an available agent for you. One moment...',
+      nb: 'Vi finner en ledig medarbeider til deg. Et øyeblikk...',
+      fr: 'Nous recherchons un agent disponible pour vous. Un moment...',
+      es: 'Estamos buscando un agente disponible para usted. Un momento...',
+    };
+    const welcomeText = welcomeTexts[lang] || welcomeTexts.en;
+    const { data: welcomeMsg } = await supabase
+      .from('messages').insert({ session_id: id, role: 'agent', text: welcomeText })
+      .select().single();
+    if (welcomeMsg) sseBroadcast(id, 'message', welcomeMsg);
 
     await postToTeams(adaptiveCard([
       { type: 'TextBlock', text: `🟢 Ny chat-session åbnet`, size: 'Medium', weight: 'Bolder', color: 'Good' },
@@ -352,10 +371,11 @@ app.post('/session/start',
         { title: 'Telefon', value: phone || '—' },
         { title: 'Sprog',   value: lang.toUpperCase() },
         { title: 'Session', value: makeShort(id) },
+        { title: 'URL',     value: page_url || '—' },
       ]},
     ]));
 
-    res.json({ session: { id, name, email, phone, lang, status: 'open' } });
+    res.json({ session: { id, name, email, phone, lang, page_url, status: 'open' } });
   }
 );
 
@@ -474,6 +494,39 @@ app.get('/messages/:sessionId', requireAgentAuth, async (req, res) => {
     .from('messages').select('*').eq('session_id', req.params.sessionId).order('id');
   if (error) return res.status(500).json({ error: 'Kunne ikke hente beskeder' });
   res.json({ messages: data });
+});
+
+// POST /session/claim – agent claimer en åben chat
+app.post('/session/claim', requireAgentAuth, async (req, res) => {
+  const { sessionId, agentName } = req.body;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId kræves' });
+
+  const { data: session } = await supabase.from('sessions').select('*').eq('id', sessionId).single();
+  if (!session) return res.status(404).json({ error: 'Session ikke fundet' });
+  if (session.status === 'closed') return res.status(410).json({ error: 'Chatten er lukket' });
+
+  // Tillad at unclaime (agentName = null) eller overtage
+  const claimedBy = agentName ? sanitizeText(agentName, 100) : null;
+  await supabase.from('sessions').update({ claimed_by: claimedBy }).eq('id', sessionId);
+
+  // Notificér alle dashboards via SSE
+  sseBroadcast(sessionId, 'claimed', { claimed_by: claimedBy });
+  res.json({ claimed_by: claimedBy });
+});
+
+// POST /agent/translate-preview – preview hvad kunden modtager (agent skriver dansk, kunden får det på sit sprog)
+app.post('/agent/translate-preview', requireAgentAuth, async (req, res) => {
+  const { sessionId, text } = req.body;
+  if (!sessionId || !text) return res.status(400).json({ error: 'sessionId og text kræves' });
+
+  const { data: session } = await supabase.from('sessions').select('lang').eq('id', sessionId).single();
+  if (!session) return res.status(404).json({ error: 'Session ikke fundet' });
+
+  const targetLang = session.lang || 'da';
+  if (targetLang === 'da') return res.json({ preview: text, lang: 'da', same_lang: true });
+
+  const translated = await translateToCustomerLang(sanitizeText(text, 2000), targetLang);
+  res.json({ preview: translated, lang: targetLang, same_lang: false });
 });
 
 // POST /translate – agenten beder manuelt om oversættelse af en bestemt tekst til dansk
